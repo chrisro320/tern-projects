@@ -6,6 +6,7 @@ All notable changes to `tern-projects` will be documented in this file.
 
 ### Added
 - **OVNFS Workspaces tab**: manage checkouts under Projects' curated project folders without Worktrunk. Includes new/fork/fresh OMP, native agent states and persisted finish marks, source changes from `ovnfs diff`, commit counts/titles, confirmed dry-run apply with partial-conflict results, new-branch commit preservation and guarded removal (including ignored/cache/large-file warnings). Distinct missing/stopped/error states, explicit daemon start, bounded visible-tab polling and a reload-safe OS operation guard; no OMP settings or conversation changes.
+- **Unassigned workspaces**: show existing checkouts grouped by source under **Not in a project**, including before the first Mine project exists. **Add as project** prefills the existing editable project form; source changes, commits, agents and safety guards also cover unassigned checkouts.
 - **Pull request checks**: GitHub Actions runs backend tests and Clippy correctness/suspicious-pattern checks on Linux, macOS (Intel), and Windows, compiles runtime Luau and enforces strict headers, and validates workflows and shell scripts. A stable **PR checks** status aggregates the results; fork runs require no secrets and use read-only permissions and pinned, verified tools.
 - **Read-only chat preview**: **Preview** (dock button, actions menu, or `Space` in Projects) opens the selected OMP or Claude Code chat in a drawer over the lower part of the panel, as a chat view (your messages right, the agent's left), without starting the agent or adding a block to the layout. Thinking and tool output stay hidden, consecutive tool calls condense to one line, and long chats show their newest part. The drawer follows the selection and keeps the selected row visible above it; `Esc`, `Space` on the shown chat, or its close button closes it.
 
@@ -15,7 +16,8 @@ All notable changes to `tern-projects` will be documented in this file.
 ### Fixed
 - **Workspace mutation safety**: Enter honors Cancel and other focused dialog buttons; queued operations and save-then-remove recheck native agents against a successful current checkout listing at execution time. Resolve agent/checkout real paths and isolate Git repository-selection environment overrides in Git and OVNFS children.
 - **Workspace roots and details**: show repository-wide capture/apply roots for curated subfolders and keep their checkouts visible. Count checkout commits against an empty base for unborn sources, retain fail-closed Git errors, and re-request details cancelled by tab changes.
-- **Workspace navigation and results**: stop polling after project creation returns to Projects, use collision-free tree row keys and qualified selection IDs with scrolling, and persist acknowledgement of results finishing in an already shown agent tab.
+- **Workspace navigation and results**: project creation started from Workspaces stays there on save or cancel, selects the expanded new project and regroups its checkouts. Use collision-free tree row keys and qualified selection IDs with scrolling, and persist acknowledgement of results finishing in an already shown agent tab.
+- **Panel readability**: use English-only workspace labels and reserve space beside scrollbars so settings cards, list rows and dialog content do not sit underneath the thumb.
 
 ## [0.2.12] — 2026-11-06
 

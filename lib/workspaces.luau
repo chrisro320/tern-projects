@@ -77,14 +77,14 @@ local function result_body(data: any): {any}
 	for _, path in data.merged or {} do table.insert(merged, path .. " · three-way merge") end
 	for _, item in data.conflicts or {} do table.insert(if item.markers then conflicts else untouched, item) end
 	local body = {c.note("Target: " .. tostring(data.source or "")), c.note("Source-only edits are retained. Conflicts with markers need resolving in the target folder.")}
-	append(body, note_paths("已合併 / Applied + merged", merged))
-	append(body, note_paths("有衝突 / Conflict markers", conflicts))
-	append(body, note_paths("未動 / Left untouched", untouched))
+	append(body, note_paths("Applied + merged", merged))
+	append(body, note_paths("Conflict markers", conflicts))
+	append(body, note_paths("Left untouched", untouched))
 	return body
 end
 local function info_body(info: any): {any}
 	local body = {}
-	append(body, note_paths("原始碼改動 / Source changes", info.changes or {}))
+	append(body, note_paths("Source changes", info.changes or {}))
 	if info.commits and type(info.commits) == "table" then
 		append(body, note_paths(tostring(info.commits.count) .. " commits not brought back", info.commits.titles or {}))
 		if info.commits.count > 25 then table.insert(body, c.note("Showing the newest 25 commit titles.")) end
@@ -111,8 +111,8 @@ local function failure(s: any, err: string)
 	s.cx:toast("error", "Workspace operation blocked", w.error)
 	s.cx:render()
 end
-function M.init(s: any, live: (any) -> boolean, launch: (any, string) -> ())
-	s.workspaces = {state = "loading", projects = {}, roots = {}, checkouts = {}, cache = {}, agents = {}, locations = {}, order = {}, rows = {}, seq = 0, flow = 0, live = live, launch = launch, active = false, busy = false}
+function M.init(s: any, live: (any) -> boolean, launch: (any, string) -> (), add_project: (any, string) -> ())
+	s.workspaces = {state = "loading", projects = {}, roots = {}, checkouts = {}, cache = {}, agents = {}, locations = {}, order = {}, rows = {}, seq = 0, flow = 0, live = live, launch = launch, add_project = add_project, active = false, busy = false}
 end
 local function alive(s: any): boolean return s.workspaces.live(s) end
 local function agent_request(s: any)
@@ -139,12 +139,10 @@ function M.refresh(s: any)
 		local old_pid = w.pid
 		w.pid = data.pid
 		w.checkouts = if data.state == "running" then data.checkouts or {} else {}
-		local wanted = {}
-		for _, root in w.roots do if root.source then wanted[root.source] = true end end
 		for _, checkout in w.checkouts do
 			local key = checkout.identity .. ":" .. checkout.touched .. ":" .. tostring(w.pid)
 			local cached = w.cache[checkout.name]
-			if wanted[checkout.source_location] and (not cached or cached.key ~= key or old_pid ~= w.pid) then
+			if not cached or cached.key ~= key or old_pid ~= w.pid then
 				w.cache[checkout.name] = {key = key, loading = true}
 				request(payload(checkout, "details"), function(info, detail_error)
 					if w.cache[checkout.name] and w.cache[checkout.name].key == key then
@@ -297,6 +295,7 @@ local function choose(s: any, verb: string, key: string)
 	if verb == "refresh" then w.error = nil; w.cache = {}; M.refresh(s); return end
 	if verb == "cancel" then close(w); return end
 	if verb == "start" then operate(s, {action = "start"}, nil, function() close(w) end); return end
+	if verb == "add-project" then w.add_project(s, key); return end
 	if verb == "new" then
 		close(w)
 		local d = dialog(w, "loading", "Checking capture root…", {c.note("Project folder: " .. key)}, buttons())
@@ -418,35 +417,72 @@ function M.view(s: any): {any}
 	if w.external_busy or w.busy then table.insert(nodes, c.banner("ws-pending", "info", nil, "A workspace operation is in progress. It continues across plugin reloads; no operation will be replayed.", nil, true)) end
 	if w.error then table.insert(nodes, c.banner("ws-error", "error", "warn", w.error)) end
 	local agents = grouped_agents(w)
+	local function checkout_rows(prefix: string, checkouts: {any})
+		local seen = {}
+		local function checkout_row(checkout: any, depth: number)
+			if seen[checkout.name] then return end
+			seen[checkout.name] = true
+			local cached = w.cache[checkout.name]
+			local info = cached and cached.info
+			local count = if info then tostring(#(info.changes or {})) else "…"
+			local description = count .. " source changes"
+			if info and info.commits and type(info.commits) == "table" then description ..= " · " .. tostring(info.commits.count) .. " commits not brought back" end
+			if cached and (cached.error or (info and type(info.error) == "string")) then description ..= " · details unavailable" end
+			description ..= " · " .. string.sub(checkout.touched, 1, 19):gsub("T", " ")
+			row("checkout:" .. prefix .. checkout.name, checkout.name, description, "menu", checkout.name, if depth > 1 then "branch" else "folder-open", depth)
+			for _, agent in agents[checkout.name] or {} do
+				local labels = {working = "Working", waiting_input = "Waiting for you", idle = "Idle", done = "Done", failed = "Failed", exited = "Idle"}
+				row("agent:" .. prefix .. tostring(agent.pane), labels[agent.state] or labels.idle, agent.title, "agent", tostring(agent.pane), if agent.state == "working" then "play" elseif agent.state == "waiting_input" then "bell" elseif agent.state == "failed" then "warn" else "circle", depth + 1)
+			end
+			for _, child in checkouts do if child.parent_name == checkout.name then checkout_row(child, depth + 1) end end
+		end
+		for _, checkout in checkouts do if not checkout.parent_name then checkout_row(checkout, 1) end end
+		for _, checkout in checkouts do checkout_row(checkout, 1) end
+	end
+	local assigned = {}
 	for _, project in w.projects do
-		table.insert(rows, c.header("project:" .. tostring(project.id), project.name))
+		local project_key = "project:" .. tostring(project.id)
+		-- Workspace projects are always expanded; keep their heading selectable after creation.
+		row(project_key, project.name, nil, "select", project_key, project.icon or "folder", 0)
 		for _, folder in project.folders or {} do
 			local prefix = tostring(project.id) .. ":" .. folder .. ":"
 			row("synthetic:" .. prefix .. "new", fmt.path(folder), "New workspace", "new", folder, "folder-plus", 0)
-			local seen = {}
-			local function checkout_row(checkout: any, depth: number)
-				if seen[checkout.name] then return end
-				seen[checkout.name] = true
-				local cached = w.cache[checkout.name]
-				local info = cached and cached.info
-				local count = if info then tostring(#(info.changes or {})) else "…"
-				local description = count .. " source changes"
-				if info and info.commits and type(info.commits) == "table" then description ..= " · " .. tostring(info.commits.count) .. " commits not brought back" end
-				if cached and (cached.error or (info and type(info.error) == "string")) then description ..= " · details unavailable" end
-				description ..= " · " .. string.sub(checkout.touched, 1, 19):gsub("T", " ")
-				row("checkout:" .. prefix .. checkout.name, checkout.name, description, "menu", checkout.name, if depth > 1 then "branch" else "folder-open", depth)
-				for _, agent in agents[checkout.name] or {} do
-					local labels = {working = "工作中 / Working", waiting_input = "等你回覆 / Waiting for you", idle = "閒置 / Idle", done = "完成 / Done", failed = "失敗 / Failed", exited = "閒置 / Idle"}
-					row("agent:" .. prefix .. tostring(agent.pane), labels[agent.state] or labels.idle, agent.title, "agent", tostring(agent.pane), if agent.state == "working" then "play" elseif agent.state == "waiting_input" then "bell" elseif agent.state == "failed" then "warn" else "circle", depth + 1)
-				end
-				for _, child in w.checkouts do if child.source_location == (w.roots[folder] and w.roots[folder].source) and child.parent_name == checkout.name then checkout_row(child, depth + 1) end end
-			end
 			local root = w.roots[folder] and w.roots[folder].source
-			for _, checkout in w.checkouts do if root and checkout.source_location == root and not checkout.parent_name then checkout_row(checkout, 1) end end
-			for _, checkout in w.checkouts do if root and checkout.source_location == root then checkout_row(checkout, 1) end end
+			local checkouts = {}
+			for _, checkout in w.checkouts do
+				if root and checkout.source_location == root then
+					assigned[checkout.name] = true
+					table.insert(checkouts, checkout)
+				end
+			end
+			checkout_rows(prefix, checkouts)
 		end
 	end
-	if #w.projects == 0 then table.insert(rows, c.empty("ws-empty", "folder-plus", "Add a project to see its workspaces", "Uses the same curated Mine projects and folders as Projects. Non-Git folders work too.")) end
+	local sources, unassigned = {}, {}
+	for _, checkout in w.checkouts do
+		if not assigned[checkout.name] then
+			local source = if type(checkout.source_location) == "string" then checkout.source_location else checkout.source
+			if not sources[source] then
+				sources[source] = {source = checkout.source, checkouts = {}}
+				table.insert(unassigned, source)
+			end
+			table.insert(sources[source].checkouts, checkout)
+		end
+	end
+	table.sort(unassigned)
+	if #unassigned > 0 then
+		table.insert(rows, c.header("synthetic:unassigned", "Not in a project"))
+		for _, source in unassigned do
+			local group = sources[source]
+			local prefix = "unassigned:" .. source .. ":"
+			table.insert(rows, ui.el("div", {key = "synthetic:" .. prefix .. "source", class = "tp-ws-source"}, {
+				ui.node("text", {text = fmt.path(group.source), title = group.source, lines = 3, role = "tern-projects.workspace-path"}),
+				ui.el("div", {class = "tp-row"}, {c.button("Add as project", act("add-project", group.source), {size = "sm", icon = "plus"})}),
+			}))
+			checkout_rows(prefix, group.checkouts)
+		end
+	end
+	if #w.projects == 0 and #w.checkouts == 0 then table.insert(rows, c.empty("ws-empty", "folder-plus", "Add a project to see its workspaces", "Uses the same curated Mine projects and folders as Projects. Non-Git folders work too.")) end
 	w.rows, w.order = keys, order
 	table.insert(nodes, ui.node("list", {key = "workspace", selected = if w.selected and keys[w.selected] then "main.workspace." .. w.selected else nil, max = 1, role = "tern-projects.rows"}, rows))
 	return nodes

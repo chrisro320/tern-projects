@@ -29,7 +29,7 @@
 	&.sf-main > [data-role="tern-projects.rows"] > .sf-list-scroll {
 		height: 100%;
 		max-height: none !important;
-		padding: 0 6px 16px 2px;
+		padding: 0 14px 16px 2px;
 		/* Rows scrolling under the dock fade out instead of being cut mid-line. */
 		mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), transparent);
 	}
@@ -40,6 +40,7 @@
 	.tp-ws-menu { display: flex; flex-direction: column; gap: 8px; padding: 12px; }
 	.tp-ws-menu .tp-btn { justify-content: flex-start; }
 	.tp-ws-form { max-height: 58vh; overflow-y: auto; }
+	.tp-ws-source { display: flex; flex-direction: column; gap: 6px; padding: 14px 8px 3px; }
 	[data-role="tern-projects.rows"] .sf-item[data-role="tern-projects.workspace-row"] {
 		display: grid;
 		grid-template-columns: auto minmax(0, 1fr);
@@ -314,7 +315,7 @@
 	.tp-dock-a { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0 0 24px; }
 
 	/* Settings ------------------------------------------------------------------------ */
-	.tp-settings { display: flex; flex: 1 1 0; flex-direction: column; gap: 6px; min-height: 0; overflow: auto; padding-bottom: 12px; }
+	.tp-settings { display: flex; flex: 1 1 0; flex-direction: column; gap: 6px; min-height: 0; overflow: auto; padding: 0 14px 12px 0; }
 	.tp-sec-t { margin: 12px 8px 0; font: 600 11.5px var(--sans); color: var(--t3); }
 	.tp-sec-t:first-child { margin-top: 2px; }
 	.tp-card { --tp-surface: var(--card); display: flex; flex-direction: column; border-radius: 10px; background: var(--card); box-shadow: 0 0 0 1px var(--l2); }
@@ -396,6 +397,8 @@
 
 	/* Overlay cards and menus: opaque like Tern's sheets, never see-through. */
 	.sf-overlay[data-role^="tern-projects."] .sf-ov-card { --tp-surface: var(--card); background: var(--card); backdrop-filter: none; }
+	/* Tern overlays scrollbars on top of their scrollports; keep content clear of the thumb. */
+	.sf-list-scroll, .sf-ov-body, .pk-scroll, .tp-ws-form { padding-right: 14px; }
 	.sf-ov-title { font: 600 13px var(--sans); }
 	[data-role="tern-projects.menu"] .sf-item { min-height: 28px; padding: 0 8px; gap: 8px; border-radius: 6px; font-size: 13px; }
 	[data-role="tern-projects.menu"] .sf-item .sf-item-ic { color: var(--t2); }

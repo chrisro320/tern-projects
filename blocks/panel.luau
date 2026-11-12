@@ -401,6 +401,7 @@ local function open_editor(s: any, p: any?)
 	cancel_flow(s)
 	s.editor = editor.new(p)
 	local draft = s.editor
+	draft.origin_mode = s.mode
 	if not p and s.ctx_cwd ~= "" then
 		request(s, {op = "folders", path = s.ctx_cwd, cwd = s.ctx_cwd, offset = 0, limit = 1}, function(data)
 			if s.editor == draft and #draft.folders == 0 then editor.add_folder(draft, data.path) end
@@ -538,10 +539,14 @@ local function editor_intent(s: any, intent: string?, value: string?)
 				reload(s); return
 			end
 			if err then d.error = fmt.error(err) else
-				if s.mode == "workspaces" then workspaces.leave(s) end
-				s.editor = nil; s.view = "mine"; s.mode = "projects"
+				s.editor = nil; s.view = "mine"
+				s.mode = if d.origin_mode == "workspaces" then "workspaces" else "projects"
 				local p = data and data.project
-				if p then local key = "project:" .. tostring(p.id); s.sel = key; s.expanded[key] = true end
+				if p then
+					local key = "project:" .. tostring(p.id)
+					s.sel = key; s.expanded[key] = true
+					if s.mode == "workspaces" then s.workspaces.selected = key end
+				end
 				toast(s, "success", if d.id then "Saved " .. d.name.text else "Created " .. d.name.text)
 				s.cx:frame({{"focus", NULL}})
 				reload(s)
@@ -1859,6 +1864,8 @@ local panel: BlockDef<any> = {
 			cancel_flow(state)
 			state.launch_target = {cwd = cwd, label = fmt.basename(cwd), folders = 1}
 			launch_plan(state, "omp", false)
+		end, function(state: any, source: string)
+			open_editor(state, {name = fmt.basename(fmt.path(source)), folders = {source}})
 		end)
 		if saved then
 			if saved.mode == "workspaces" then s.mode = "workspaces" end

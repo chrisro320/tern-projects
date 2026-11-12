@@ -75,6 +75,8 @@ For chats already hidden by a folder change made before this fix, find them in *
 
 Install [OVNFS](https://github.com/stencil-hq/ovnfs) on the host, open **Projects → Workspaces**, and use **Add project** to choose one or more source folders (Git is optional). Click a folder for **New workspace**, or a checkout for its actions. This uses Projects' existing **Mine** library, not a second project list. Names are globally unique, start with a lowercase letter or number, and contain at most 64 lowercase letters, numbers, dots, underscores or hyphens.
 
+Existing checkouts whose source is not in any Mine project appear under **Not in a project**, grouped by source folder, even when you have no projects. Their source changes, commits, agents and guarded actions work just like assigned workspaces. **Add as project** opens the project editor with the source folder and its basename filled in; you can edit either before saving. Both this button and the Workspaces header's **Add project** keep you in Workspaces on save or cancel. Saved projects are selected and expanded, and matching checkouts move under them. Workspace labels use the same English-only wording as the rest of Projects.
+
 For a curated subfolder inside a Git repository, **New workspace** shows both the project folder and the actual repository-wide **capture / apply target** before creation. The resulting checkouts stay listed under that project folder. Tab moves from the name field to Cancel and then Create; Enter activates the focused button, or the primary action only while the field is focused.
 
 The tab checks OVNFS every two seconds while open. Missing binary, stopped daemon and command errors are distinct; only the explicit **Start** button starts the default daemon. `OVNFS_STATE` and `OVNFS_MOUNT` are inherited. At most three management requests run concurrently. Source-change counts come from `ovnfs diff`, **not** its `dirty` flag, and are refreshed after touched/pid changes or plugin operations, including snapshots, forks and daemon restarts.
@@ -86,6 +88,8 @@ Agent states come from Tern, including agents launched outside Projects. Cwds an
 Queued mutations re-read native agents and require the confirmed checkout in a fresh successful OVNFS listing when their request slot opens. Saving a branch before removal is a separate stage; removal repeats that authorization after saving. Failed listings never stand in for an empty agent list. Git and OVNFS children discard inherited Git repository/index/object/ref-selection overrides, so a launching shell cannot redirect these checks to another repository.
 
 The commit badge compares checkout HEAD with the source's current HEAD (`rev-list --count <source-tip>..HEAD`). An unborn source has an empty base, so all checkout commits are counted; unreadable Git metadata still blocks removal. Click **Show source changes / commits** for the newest 25 titles. Plain Apply copies working-tree changes, **not commits**. **Save commits as branch** requires a new branch name and leaves the source working tree alone; an existing branch (especially the checked-out one) is refused. Removal warns that ignored files, caches and files over 100 MB are deleted too, even though source-change counts exclude them. Unreturned commits can be saved to a new source-repo branch before removal. No Worktrunk, OMP extension, settings edit, task or review integration is required.
+
+Scrolling lists, Settings, pickers and dialogs reserve a right-hand gutter so their content stays clear of Tern's overlay scrollbar.
 
 ---
 

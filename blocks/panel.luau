@@ -60,7 +60,8 @@ end
 
 -- Recents scope: a plugin-level memory of the choice (a reopened panel has no saved state)
 -- and the key of the list a snapshot would show, so stale rows never appear under a new scope.
-local RECENTS_KEY = "recents-filter:v1"
+-- v1 and the saved `recent_filter` field held the old automatic All default, so they are not read.
+local RECENTS_KEY = "recents-filter:v2"
 local function recent_key(s: any): string
 	return if s.recent_filter == "folder" then "folder:" .. s.ctx_cwd else "all"
 end
@@ -930,14 +931,14 @@ local MENU_META: {[string]: any} = {
 	["filter-project=all"] = {label = "Clear project filter", icon = "x"},
 	["sort=updated"] = {label = "Sort: Newest", icon = "clock"},
 	["sort=relevance"] = {label = "Sort: Best match", icon = "sparkle"},
-	["recent=all"] = {label = "Recents: All chats", icon = "layers"},
 	["recent=folder"] = {label = "Recents: This folder", icon = "folder"},
+	["recent=all"] = {label = "Recents: All chats", icon = "layers"},
 }
 local function open_menu(s: any, key: string?)
 	key = key or s.sel
 	cancel_flow(s)
 	if not key or not s.rows[key] or (s.rows[key].kind ~= "session" and s.rows[key].kind ~= "project") then
-		local ids = if s.mode == "search" then {"scope=workspace", "scope=repository", "scope=all", "-", "filter", "filter-project=all", "-", "sort=updated", "sort=relevance"} else {"new-chat", "new-chat-with…", "create", "-", "recent=all", "recent=folder", "-", "refresh"}
+		local ids = if s.mode == "search" then {"scope=workspace", "scope=repository", "scope=all", "-", "filter", "filter-project=all", "-", "sort=updated", "sort=relevance"} else {"new-chat", "new-chat-with…", "create", "-", "recent=folder", "recent=all", "-", "refresh"}
 		s.menu = {ids = ids, selected = ids[1], title = if s.mode == "search" then "Search options" else "Projects"}
 		return
 	end
@@ -1536,11 +1537,11 @@ local function search_bar(s: any): {any}
 		ui.el("div", {key = "search-controls", class = "tp-bar"}, controls),
 	}
 end
--- Recents scope: All chats (default, unchanged list) or only chats started where Search's Worktree scope looks.
+-- Recents scope: This folder (default; chats started where Search's Worktree scope looks) or All chats.
 local function recent_filter_seg(s: any): any
 	return c.seg({
-		{id = "all", label = "All", title = "Recent chats from every folder"},
 		{id = "folder", label = "This folder", title = "Recent chats started in " .. fmt.path(s.ctx_cwd)},
+		{id = "all", label = "All", title = "Recent chats from every folder"},
 	}, s.recent_filter, "recent", {size = "sm", key = "recent-filter"})
 end
 local function list_view(s: any): any
@@ -1857,7 +1858,7 @@ local function menu_view(s: any): any
 			table.insert(kids, ui.node("rule", {key = "sep" .. tostring(n)}))
 		else
 			local meta = MENU_META[id] or {label = id}
-			local checked = id == "scope=" .. s.scope or id == "sort=" .. s.sort or id == "recent=" .. (s.recent_filter or "all")
+			local checked = id == "scope=" .. s.scope or id == "sort=" .. s.sort or id == "recent=" .. s.recent_filter
 			local icon = if checked then "check" else meta.icon
 			table.insert(kids, ui.node("item", {key = id, label = meta.label, icon = icon, tone = meta.tone, hint = meta.hint, role = if meta.tone == "error" then "tern-projects.menu-danger" else "tern-projects.menu-item", actions = {click = "menu=" .. id}}))
 		end
@@ -1926,8 +1927,8 @@ local panel: BlockDef<any> = {
 		-- A reopened pane keeps the folder it was retargeted to, and the last Recents scope.
 		local carried_cwd = if type(saved) == "table" and type(saved.ctx_cwd) == "string" then saved.ctx_cwd else nil
 		local function initial_filter(): string
-			if type(saved) == "table" and (saved.recent_filter == "all" or saved.recent_filter == "folder") then return saved.recent_filter end
-			return stored_filter() or "all"
+			if type(saved) == "table" and (saved.recents == "all" or saved.recents == "folder") then return saved.recents end
+			return stored_filter() or "folder"
 		end
 		local s: any = {cx = cx, mode = args and args[1] or "projects", ctx_cwd = carried_cwd or (args and args[2] or ""), view = "mine", recent_filter = initial_filter(), recent_scope = nil, recent_pending = nil, recent_error = nil, projects = {}, pinned = {}, recent = {}, expanded = {}, more = {}, settings = {icon_style = "color"}, query = tf.new(""), query_all = false, scope = "all", sort = "updated", results = {}, total = 0, offset = 0, page = 0, rows = {}, order = {}, gen = 0, tokens = {}, alive = true, busy = false, indexing = false, loaded = false, archived = {}, launch_pending = false, launch_slow = false, launch_wait_seq = 0}
 		workspaces.init(s, live, function(state: any, cwd: string)
@@ -1971,7 +1972,7 @@ local panel: BlockDef<any> = {
 		tick()
 		return s
 	end,
-	save = function(s) return {mode = s.mode, view = s.view, query = s.query.text, scope = s.scope, sort = s.sort, recent_filter = s.recent_filter, ctx_cwd = s.ctx_cwd} end,
+	save = function(s) return {mode = s.mode, view = s.view, query = s.query.text, scope = s.scope, sort = s.sort, recents = s.recent_filter, ctx_cwd = s.ctx_cwd} end,
 	-- Width-dependent layout (row previews, icon-only controls) must follow pane resizes.
 	resize = function(s, cols, _rows, _cx) s.cols = cols end,
 	title = function(s) return if s.mode == "projects" then "Projects" elseif s.mode == "search" then "Projects · Search" elseif s.mode == "workspaces" then "Projects · Workspaces" else "Projects · Settings" end,

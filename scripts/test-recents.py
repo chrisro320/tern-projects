@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the Projects Recents All/This folder scope without a model or network."""
+"""Exercise the Projects Recents This folder/All scope without a model or network."""
 import argparse
 from pathlib import Path
 import shutil
@@ -94,35 +94,41 @@ local function start(saved)
 end
 -- A new panel waits for its first snapshot instead of showing the previous scope.
 local s = panel.init(cx, {"projects", "/tmp/recents/repo"}, nil)
-check(s.recent_filter == "all", "Recents defaults to All")
+check(s.recent_filter == "folder", "Recents defaults to This folder")
 check(#s.recent == 0 and note(s, "recent:wait") == "Loading chats…", "a new panel shows a loading state")
 flush()
-check(last_snapshot().recent_cwd == nil, "All sends the global snapshot without a folder")
-check(uids(s.recent) == "all-1,all-2", "All keeps the unchanged newest-first list")
-check(shows(s, "all-1") and not shows(s, "repo-1"), "All rows come from the global list")
--- Switching scope drops the old rows at once and shows the loading state.
-action(s, "recent", "folder")
-check(#s.recent == 0 and note(s, "recent:wait") == "Loading chats…", "switching scope shows a loading state")
-check(not shows(s, "all-1") and not shows(s, "all-2"), "the previous scope's chats are not shown while loading")
-flush()
-check(s.recent_filter == "folder", "This folder is selected")
 check(last_snapshot().recent_cwd == "/tmp/recents/repo", "This folder scopes the snapshot to the panel path")
 check(uids(s.recent) == "repo-1", "This folder shows only its chats")
-check(shows(s, "repo-1") and not shows(s, "all-1"), "This folder replaces the global rows")
-check(kv["recents-filter:v1"] == "folder", "the choice is remembered outside the panel state")
--- A reopened panel has no saved state and still keeps This folder.
+check(shows(s, "repo-1") and not shows(s, "all-1"), "This folder rows come from the folder list")
+-- Switching scope drops the old rows at once and shows the loading state.
+action(s, "recent", "all")
+check(#s.recent == 0 and note(s, "recent:wait") == "Loading chats…", "switching scope shows a loading state")
+check(not shows(s, "repo-1"), "the previous scope's chats are not shown while loading")
+flush()
+check(s.recent_filter == "all", "All is selected")
+check(last_snapshot().recent_cwd == nil, "All sends the global snapshot without a folder")
+check(uids(s.recent) == "all-1,all-2", "All keeps the unchanged newest-first list")
+check(shows(s, "all-1") and not shows(s, "repo-1"), "All replaces the folder rows")
+check(kv["recents-filter:v2"] == "all", "the choice is remembered outside the panel state")
+-- A reopened panel has no saved state and still keeps All.
 local reopened = start(nil)
-check(reopened.recent_filter == "folder", "reopening the panel keeps This folder")
+check(reopened.recent_filter == "all", "reopening the panel keeps All")
 flush()
-check(last_snapshot().recent_cwd == "/tmp/recents/repo", "the reopened panel scopes to its folder")
-check(uids(reopened.recent) == "repo-1", "the reopened panel lists that folder")
+check(last_snapshot().recent_cwd == nil, "the reopened panel requests the global list")
+check(uids(reopened.recent) == "all-1,all-2", "the reopened panel lists every folder")
 -- Saved panel state still wins over the remembered choice.
-local saved_all = start({recent_filter = "all"})
-check(saved_all.recent_filter == "all", "saved panel state restores its own scope")
+local saved_folder = start({recents = "folder"})
+check(saved_folder.recent_filter == "folder", "saved panel state restores its own scope")
 flush()
-check(last_snapshot().recent_cwd == nil, "the restored scope decides the request")
+check(last_snapshot().recent_cwd == "/tmp/recents/repo", "the restored scope decides the request")
+-- Values written under the old All default are not read back.
+kv["recents-filter:v2"] = nil
+kv["recents-filter:v1"] = "all"
+local legacy = start({recent_filter = "all"})
+check(legacy.recent_filter == "folder", "old automatic All values fall back to This folder")
+flush()
 -- An empty folder says so instead of showing chats from elsewhere.
-local folder = start({recent_filter = "folder"})
+local folder = start({recents = "folder"})
 check(#folder.recent == 0 and note(folder, "recent:wait") == "Loading chats…", "a restored folder waits for its own list")
 flush()
 scoped_recent = {}

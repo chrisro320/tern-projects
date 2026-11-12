@@ -32,18 +32,27 @@ local function request(payload: any, cb: (any, string?) -> (), current: () -> bo
 	pump()
 end
 local function act(verb: string, key: string?): string return "ws=" .. verb .. ":" .. fmt.pct(key or "") end
-local function under(path: string, root: string): boolean return path == root or string.sub(path, 1, #root + 1) == root .. "/" end
+local function under(path: string, root: string): boolean
+	if tern.runtime.os == "windows" then path = path:gsub("\\", "/"); root = root:gsub("\\", "/") end
+	return path == root or string.sub(path, 1, #root + 1) == root .. "/"
+end
 local function target(w: any, key: string): any
 	for _, checkout in w.checkouts do if checkout.name == key then return checkout end end
 	return nil
 end
+local function agent_inside(agent: any, location: any, checkout: any): boolean
+	if type(location) == "string" then return type(checkout.location) == "string" and under(location, checkout.location) end
+	local cwd = agent.cwd
+	return type(cwd) == "string" and ((type(checkout.path) == "string" and under(cwd, checkout.path)) or (type(checkout.location) == "string" and under(cwd, checkout.location)))
+end
 local function grouped_agents(w: any): any
 	local out = {}
 	for _, agent in w.agents do
-		local best = nil
+		local best, length = nil, -1
 		local location = w.locations[agent.cwd or ""]
 		for _, checkout in w.checkouts do
-			if type(location) == "string" and type(checkout.location) == "string" and under(location, checkout.location) and (not best or #checkout.location > #best.location) then best = checkout end
+			local size = #(if type(checkout.location) == "string" then checkout.location else checkout.path)
+			if agent_inside(agent, location, checkout) and size > length then best = checkout; length = size end
 		end
 		if best then
 			out[best.name] = out[best.name] or {}
@@ -88,6 +97,10 @@ local function info_body(info: any): {any}
 	if info.commits and type(info.commits) == "table" then
 		append(body, note_paths(tostring(info.commits.count) .. " commits not brought back", info.commits.titles or {}))
 		if info.commits.count > 25 then table.insert(body, c.note("Showing the newest 25 commit titles.")) end
+		if info.commits.count > 0 and type(info.commits.head) ~= "string" then
+			local refs = info.commits.refs or {}
+			table.insert(body, c.note("These commits are on retained branches or refs" .. (if #refs > 0 then ": " .. table.concat(refs, ", ") else "") .. ", not the checked-out branch, which has no commits yet. Switch this workspace to a branch containing these commits (or create a branch at a retained ref), then use Save branch. Save branch, then remove cannot save an unborn HEAD.", "warning"))
+		end
 	end
 	if type(info.error) == "string" then table.insert(body, c.banner("git-error", "error", "warn", info.error)) end
 	return body
@@ -112,7 +125,7 @@ local function failure(s: any, err: string)
 	s.cx:render()
 end
 function M.init(s: any, live: (any) -> boolean, launch: (any, string) -> (), add_project: (any, string) -> ())
-	s.workspaces = {state = "loading", projects = {}, roots = {}, checkouts = {}, cache = {}, agents = {}, locations = {}, order = {}, rows = {}, seq = 0, flow = 0, live = live, launch = launch, add_project = add_project, active = false, busy = false}
+	s.workspaces = {state = "loading", membership = "loading", library_seq = 0, projects = {}, roots = {}, checkouts = {}, cache = {}, agents = {}, locations = {}, order = {}, rows = {}, seq = 0, flow = 0, live = live, launch = launch, add_project = add_project, active = false, busy = false}
 end
 local function alive(s: any): boolean return s.workspaces.live(s) end
 local function agent_request(s: any)
@@ -124,11 +137,47 @@ local function details(s: any, checkout: any, cb: (any) -> (), verb: string?)
 		if err then failure(s, err) else cb(data); s.cx:render() end
 	end, function() return alive(s) and w.active and w.flow == flow end)
 end
+local function load_roots(s: any, folders: {string}, initial: boolean)
+	local w = s.workspaces
+	local seq, library_seq = w.seq, w.library_seq
+	w.root_polling = true
+	request({action = "roots", paths = (tern.json :: any).array(folders)}, function(roots, err)
+		w.root_polling = false
+		if initial then
+			w.membership, w.membership_error = if err then "error" else "ready", err
+			if not err then w.roots = roots end
+		else
+			for _, folder in folders do w.roots[folder] = if err then {error = err} else roots[folder] end
+		end
+		s.cx:render()
+	end, function() return alive(s) and w.active and w.seq == seq and w.library_seq == library_seq end)
+end
+local function load_library(s: any)
+	local w = s.workspaces
+	w.library_seq += 1; w.membership = "loading"; w.membership_error = nil; w.root_polling = false
+	local seq, library_seq = w.seq, w.library_seq
+	cli.request({op = "snapshot", view = "mine", per = 0, recent = 0}, function(data: any, err: string?)
+		if not alive(s) or not w.active or w.seq ~= seq or w.library_seq ~= library_seq then return end
+		if err then w.membership = "error"; w.membership_error = err; s.cx:render(); return end
+		w.projects = data.projects or {}
+		local folders = {}
+		for _, project in w.projects do for _, folder in project.folders or {} do table.insert(folders, folder) end end
+		load_roots(s, folders, true)
+		s.cx:render()
+	end)
+end
 function M.refresh(s: any)
 	local w = s.workspaces
 	if not alive(s) or not w.active or w.polling then return end
 	agent_request(s)
 	if not w.visible then return end
+	if w.membership == "ready" and not w.root_polling then
+		local retry = {}
+		for _, project in w.projects do for _, folder in project.folders or {} do
+			if w.roots[folder] and w.roots[folder].error then table.insert(retry, folder) end
+		end end
+		if #retry > 0 then load_roots(s, retry, false) end
+	end
 	w.polling = true
 	local seq = w.seq
 	local current = function() return alive(s) and w.active and w.seq == seq end
@@ -160,17 +209,7 @@ function M.enter(s: any)
 	if w.active then return end
 	w.active = true; w.seq += 1; w.polling = false
 	local seq = w.seq
-	cli.request({op = "snapshot", view = "mine", per = 0, recent = 0}, function(data: any, err: string?)
-		if not alive(s) or not w.active or w.seq ~= seq then return end
-		if err then w.error = err else w.projects = data.projects or {} end
-		local folders = {}
-		for _, project in w.projects do for _, folder in project.folders or {} do table.insert(folders, folder) end end
-		request({action = "roots", paths = (tern.json :: any).array(folders)}, function(roots, root_error)
-			if root_error then w.error = root_error else w.roots = roots end
-			M.refresh(s); s.cx:render()
-		end, function() return alive(s) and w.active and w.seq == seq end)
-		M.refresh(s); s.cx:render()
-	end)
+	load_library(s)
 	M.refresh(s)
 	local function tick()
 		tern.timer(2000, function()
@@ -189,28 +228,58 @@ end
 function M.library_changed(s: any)
 	local w = s.workspaces
 	if not w.active then M.enter(s); return end
-	M.leave(s)
-	M.enter(s)
+	-- Library reloads (including the panel's timer) are not view-leave transitions.
+	load_library(s)
+	M.refresh(s)
 end
 local function authorize(s: any, req: any, checkout: any, done: (string?) -> ())
 	local w = s.workspaces
 	if not alive(s) then done("Projects panel closed before workspace authorization"); return end
-	w.nonce = tostring(tern.now()) .. ":" .. tostring(s.cx.pane)
-	local nonce = w.nonce
-	w.authorization = function(agents: any, err: string?)
-		w.authorization = nil; w.nonce = nil
+	local flow = w.flow
+	local function snapshot(cb: (any, string?) -> ())
+		w.snapshot_seq = (w.snapshot_seq or 0) + 1
+		w.nonce = tostring(tern.now()) .. ":" .. tostring(s.cx.pane) .. ":" .. tostring(w.snapshot_seq)
+		local nonce = w.nonce
+		w.authorization = function(agents: any, err: string?)
+			w.authorization = nil; w.nonce = nil
+			cb(agents, err)
+		end
+		agent_request(s)
+		tern.timer(2000, function()
+			if w.nonce == nonce and w.authorization then w.authorization(nil, "Cannot read live Tern agents. Focus this local Projects panel and retry.") end
+		end)
+	end
+	local function bind(agents: any): any
+		local rows = (tern.json :: any).array({})
+		for _, agent in agents do table.insert(rows, {cwd = agent.cwd, state = agent.state, live = agent.live}) end
+		return rows
+	end
+	snapshot(function(agents, err)
 		if err then done(err); return end
 		local auth = payload(checkout, "authorize")
 		auth.removing = req.action == "remove" or req.action == "save-before-remove"
-		auth.agents = (tern.json :: any).array({})
-		for _, agent in agents do table.insert(auth.agents, {cwd = agent.cwd, state = agent.state, live = agent.live}) end
-		-- This runs inside the reserved queue slot, immediately before the mutation.
-		-- The backend re-lists the confirmed checkout and resolves both agent/checkout paths.
-		cli.request({op = "workspaces", request = auth}, function(_data: any, auth_error: string?) done(auth_error) end)
-	end
-	agent_request(s)
-	tern.timer(2000, function()
-		if w.nonce == nonce and w.authorization then w.authorization(nil, "Cannot read live Tern agents. Focus this local Projects panel and retry.") end
+		auth.agents = bind(agents)
+		-- Resolve paths and re-list OVNFS before the final native snapshot, not after it.
+		cli.request({op = "workspaces", request = auth}, function(prepared: any, auth_error: string?)
+			if auth_error then done(auth_error); return end
+			if not alive(s) or not w.active or w.flow ~= flow then done("Projects panel left or cancelled before workspace authorization"); return end
+			snapshot(function(fresh, snapshot_error)
+				if snapshot_error then done(snapshot_error); return end
+				local locations = prepared.agent_locations
+				for _, agent in fresh do
+					local location = locations[agent.cwd or ""]
+					local inside = agent_inside(agent, location, prepared)
+					if inside and ((auth.removing and agent.live) or agent.state == "working" or agent.state == "waiting_input") then
+						done(if auth.removing then "An agent is still live here. Close its tab before removing this workspace." else "An agent is working or waiting for you here. Finish or stop it before applying."); return
+					end
+					-- A new cwd could be a symlink into this checkout. Never resolve it
+					-- slowly after this final snapshot or assume it is unrelated.
+					if type(agent.cwd) == "string" and locations[agent.cwd] == nil then done("Agent locations changed during authorization; review and retry."); return end
+				end
+				req.agents = bind(fresh)
+				done(nil) -- Synchronously sends the mutation in the already reserved slot.
+			end)
+		end)
 	end)
 end
 local function operate(s: any, req: any, checkout: any?, cb: (any) -> ())
@@ -292,7 +361,7 @@ local function submit(s: any, id: string)
 end
 local function choose(s: any, verb: string, key: string)
 	local w = s.workspaces
-	if verb == "refresh" then w.error = nil; w.cache = {}; M.refresh(s); return end
+	if verb == "refresh" then w.error = nil; w.cache = {}; load_library(s); M.refresh(s); return end
 	if verb == "cancel" then close(w); return end
 	if verb == "start" then operate(s, {action = "start"}, nil, function() close(w) end); return end
 	if verb == "add-project" then w.add_project(s, key); return end
@@ -416,6 +485,8 @@ function M.view(s: any): {any}
 	end
 	if w.external_busy or w.busy then table.insert(nodes, c.banner("ws-pending", "info", nil, "A workspace operation is in progress. It continues across plugin reloads; no operation will be replayed.", nil, true)) end
 	if w.error then table.insert(nodes, c.banner("ws-error", "error", "warn", w.error)) end
+	if w.membership == "loading" then table.insert(nodes, c.banner("ws-membership", "info", nil, "Loading Mine projects and workspace membership…"))
+	elseif w.membership == "error" then table.insert(nodes, c.banner("ws-membership", "error", "warn", "Cannot load workspace project membership: " .. fmt.error(w.membership_error))) end
 	local agents = grouped_agents(w)
 	local function checkout_rows(prefix: string, checkouts: {any})
 		local seen = {}
@@ -446,11 +517,13 @@ function M.view(s: any): {any}
 		row(project_key, project.name, nil, "select", project_key, project.icon or "folder", 0)
 		for _, folder in project.folders or {} do
 			local prefix = tostring(project.id) .. ":" .. folder .. ":"
-			row("synthetic:" .. prefix .. "new", fmt.path(folder), "New workspace", "new", folder, "folder-plus", 0)
-			local root = w.roots[folder] and w.roots[folder].source
+			local resolved = w.roots[folder]
+			local root = resolved and resolved.source
+			local detail = if resolved and resolved.error then "Source unavailable: " .. fmt.error(resolved.error) else "New workspace"
+			row("synthetic:" .. prefix .. "new", fmt.path(folder), detail, "new", folder, "folder-plus", 0)
 			local checkouts = {}
 			for _, checkout in w.checkouts do
-				if root and checkout.source_location == root then
+				if checkout.source == folder or (root and checkout.source_location == root) then
 					assigned[checkout.name] = true
 					table.insert(checkouts, checkout)
 				end
@@ -460,7 +533,7 @@ function M.view(s: any): {any}
 	end
 	local sources, unassigned = {}, {}
 	for _, checkout in w.checkouts do
-		if not assigned[checkout.name] then
+		if w.membership == "ready" and not assigned[checkout.name] then
 			local source = if type(checkout.source_location) == "string" then checkout.source_location else checkout.source
 			if not sources[source] then
 				sources[source] = {source = checkout.source, checkouts = {}}
@@ -477,12 +550,12 @@ function M.view(s: any): {any}
 			local prefix = "unassigned:" .. source .. ":"
 			table.insert(rows, ui.el("div", {key = "synthetic:" .. prefix .. "source", class = "tp-ws-source"}, {
 				ui.node("text", {text = fmt.path(group.source), title = group.source, lines = 3, role = "tern-projects.workspace-path"}),
-				ui.el("div", {class = "tp-row"}, {c.button("Add as project", act("add-project", group.source), {size = "sm", icon = "plus"})}),
 			}))
+			row("synthetic:" .. prefix .. "add", "Add as project", group.source, "add-project", group.source, "plus", 0)
 			checkout_rows(prefix, group.checkouts)
 		end
 	end
-	if #w.projects == 0 and #w.checkouts == 0 then table.insert(rows, c.empty("ws-empty", "folder-plus", "Add a project to see its workspaces", "Uses the same curated Mine projects and folders as Projects. Non-Git folders work too.")) end
+	if w.membership == "ready" and #w.projects == 0 and #w.checkouts == 0 then table.insert(rows, c.empty("ws-empty", "folder-plus", "Add a project to see its workspaces", "Uses the same curated Mine projects and folders as Projects. Non-Git folders work too.")) end
 	w.rows, w.order = keys, order
 	table.insert(nodes, ui.node("list", {key = "workspace", selected = if w.selected and keys[w.selected] then "main.workspace." .. w.selected else nil, max = 1, role = "tern-projects.rows"}, rows))
 	return nodes

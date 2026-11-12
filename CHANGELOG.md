@@ -18,6 +18,8 @@ All notable changes to `tern-projects` will be documented in this file.
 - **Workspace roots and details**: show repository-wide capture/apply roots for curated subfolders and keep their checkouts visible. Count checkout commits against an empty base for unborn sources, retain fail-closed Git errors, and re-request details cancelled by tab changes.
 - **Workspace navigation and results**: project creation started from Workspaces stays there on save or cancel, selects the expanded new project and regroups its checkouts. Use collision-free tree row keys and qualified selection IDs with scrolling, and persist acknowledgement of results finishing in an already shown agent tab.
 - **Panel readability**: use English-only workspace labels and reserve space beside scrollbars so settings cards, list rows and dialog content do not sit underneath the thumb.
+- **Workspace review safety**: count commits on surviving refs when checkout HEAD is unborn, retain agent guards for deleted checkout descendants, and take a final native agent snapshot after slow authorization (again after saving a branch). Routine library refreshes preserve dialogs and drafts. Missing project folders keep exact checkout associations with visible errors and retry resolution; loading/failed membership never offers unassigned actions. **Add as project** is selectable with arrows and Enter.
+- **Unborn HEAD recovery**: show the retained refs and plain-English steps to switch/create a branch before saving. Save-then-remove refuses an unborn HEAD; explicit warned removal remains available. No custom non-HEAD ref preservation is attempted.
 
 ## [0.2.12] — 2026-11-06
 

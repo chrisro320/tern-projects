@@ -160,6 +160,17 @@ fn authorization_uses_real_paths_and_current_successful_listing() {
     assert!(!authorize("idle", true, true).status.success());
     value(authorize("idle", true, false));
     value(authorize("done", false, true));
+    fs::remove_dir(checkout.join("nested")).unwrap();
+    // Deleted descendants retain their lexical association through both spellings.
+    for cwd in [checkout.join("nested"), alias.join("nested")] {
+        for (state, live, removing) in [("working", true, false), ("waiting_input", true, false), ("idle", true, true)] {
+            let denied = call(t.path(), json!({"action":"authorize","name":"parent","identity":c["identity"],"removing":removing,
+                "agents":[{"cwd":cwd,"state":state,"live":live}]}));
+            assert!(!denied.status.success(), "deleted cwd must block: {}", cwd.display());
+        }
+    }
+    value(call(t.path(), json!({"action":"authorize","name":"parent","identity":c["identity"],"removing":true,
+        "agents":[{"cwd":t.path().join("checkout-other/missing"),"state":"working","live":true}]})));
     let info = value(call(t.path(), json!({"action":"details","name":"parent","identity":c["identity"]})));
     fs::write(t.path().join("list-error"), "").unwrap();
     assert!(!authorize("done", false, true).status.success());
@@ -195,6 +206,47 @@ fn unborn_source_counts_checkout_commits_but_corrupt_head_blocks_removal() {
     assert!(!call(t.path(), json!({"action":"authorize","name":"parent","identity":c["identity"],"removing":true,
         "agents":[{"cwd":checkout,"state":"working","live":true}]})).status.success());
     fs::write(source.join(".git/HEAD"), "unreadable HEAD\n").unwrap();
+    let broken = info();
+    assert!(broken["error"].is_string(), "{broken}");
+    let removal = call(t.path(), json!({"action":"remove","name":"parent","identity":c["identity"],"expected":broken["token"]}));
+    assert!(!removal.status.success());
+    assert!(String::from_utf8_lossy(&removal.stderr).contains("Cannot safely check"));
+    assert!(!fs::read_to_string(t.path().join("calls")).unwrap().contains("rm "));
+}
+#[test]
+fn unborn_checkout_counts_other_refs_and_blocks_unreadable_history() {
+    let t = fixture();
+    let source = t.path().join("source");
+    let checkout = t.path().join("checkout");
+    init_repo(&source);
+    git(&source, &["commit", "--allow-empty", "-m", "source base"]);
+    init_repo(&checkout);
+    let c = set_checkout(t.path(), &source, &checkout, true);
+    let info = || value(call(t.path(), json!({"action":"details","name":"parent","identity":c["identity"]})));
+    // Even a source with commits does not make a truly empty checkout nonempty.
+    assert_eq!(info()["commits"]["count"], 0);
+    git(&checkout, &["fetch", source.to_str().unwrap(), "main"]);
+    git(&checkout, &["reset", "--hard", "FETCH_HEAD"]);
+    for title in ["private first", "private second"] { git(&checkout, &["commit", "--allow-empty", "-m", title]); }
+    git(&checkout, &["tag", "retained-tag"]);
+    git(&checkout, &["switch", "--orphan", "empty-head"]);
+    let orphan = info();
+    assert!(orphan["error"].is_null(), "{orphan}");
+    assert!(orphan["commits"]["head"].is_null());
+    assert_eq!(orphan["commits"]["count"], 2);
+    let titles = orphan["commits"]["titles"].as_array().unwrap();
+    assert_eq!(titles.len(), 2);
+    assert!(titles.iter().any(|title| title.as_str().unwrap().ends_with("private second")));
+    assert!(!titles.iter().any(|title| title.as_str().unwrap().ends_with("source base")));
+    assert!(orphan["commits"]["refs"].as_array().unwrap().contains(&json!("refs/heads/main")));
+    let save = call(t.path(), json!({"action":"save-before-remove","name":"parent","identity":c["identity"],"expected":orphan["token"],"branch":"saved"}));
+    assert!(!save.status.success());
+    assert!(String::from_utf8_lossy(&save.stderr).contains("Switch the workspace to a retained branch"));
+    assert!(!fs::read_to_string(t.path().join("calls")).unwrap().contains("apply parent --branch"));
+    // A tag alone also keeps the history alive, without counting duplicate refs.
+    git(&checkout, &["branch", "-D", "main"]);
+    assert_eq!(info()["commits"]["count"], 2);
+    fs::write(checkout.join(".git/refs/heads/broken"), "1111111111111111111111111111111111111111\n").unwrap();
     let broken = info();
     assert!(broken["error"].is_string(), "{broken}");
     let removal = call(t.path(), json!({"action":"remove","name":"parent","identity":c["identity"],"expected":broken["token"]}));

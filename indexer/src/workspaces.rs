@@ -182,8 +182,24 @@ fn commits(c: &Value) -> Result<Value> {
         let count: u64 = git(path, &["rev-list", "--count", &range])?.parse()?;
         let log = git(path, &["log", "-25", "--format=%h %s", &range])?;
         (count, log.lines().map(str::to_owned).collect::<Vec<_>>())
-    } else { (0, Vec::new()) };
-    Ok(json!({"count":count, "tip":tip, "head":head, "titles":titles}))
+    } else {
+        // An orphan HEAD can coexist with commits on other refs. Only a genuinely
+        // empty ref graph is empty; unreadable refs/objects must block removal.
+        let total: u64 = git(path, &["rev-list", "--count", "--all"])?.parse()?;
+        if total == 0 { (0, Vec::new()) } else {
+            let mut args = Vec::with_capacity(6);
+            args.extend(["rev-list", "--count", "--all"]);
+            if let Some(tip) = tip.as_deref() { args.extend(["--not", tip]); }
+            let count: u64 = if tip.is_none() { total } else { git(path, &args)?.parse()? };
+            args[0] = "log"; args[1] = "--format=%h %s"; args.insert(2, "-25");
+            let log = git(path, &args)?;
+            (count, log.lines().map(str::to_owned).collect::<Vec<_>>())
+        }
+    };
+    let refs = if head.is_none() && count > 0 {
+        git(path, &["for-each-ref", "--format=%(refname)"])?.lines().map(str::to_owned).collect::<Vec<_>>()
+    } else { Vec::new() };
+    Ok(json!({"count":count, "tip":tip, "head":head, "titles":titles, "refs":refs}))
 }
 fn details(c: &Value) -> Result<Value> {
     let diff = ovnfs(&["diff", c["name"].as_str().unwrap(), "--json"], false)?;
@@ -220,19 +236,29 @@ fn save_branch(c: &Value, branch: &str) -> Result<Value> {
 
 fn authorize(req: &Request) -> Result<Value> {
     // Always use a successful current listing, not the panel's last (possibly failed) poll.
-    let c = checkout(req)?;
-    let root = std::fs::canonicalize(c["path"].as_str().context("workspace path missing")?)
-        .context("Cannot resolve workspace path")?;
+    let mut c = checkout(req)?;
+    let raw = c["path"].as_str().context("workspace path missing")?;
+    let root = real_path(raw).context("Cannot resolve workspace path")?;
+    let mut locations = serde_json::Map::new();
     for agent in req.agents.as_ref().context("Fresh Tern agent snapshot required")? {
-        // One unresolvable agent elsewhere must not disable all workspace management.
-        let Some(path) = agent.cwd.as_deref().and_then(|p| std::fs::canonicalize(p).ok()) else { continue; };
-        if path.starts_with(&root) && (agent.state == "working" || agent.state == "waiting_input"
+        let Some(cwd) = agent.cwd.as_deref() else { continue; };
+        let location = real_path(cwd).ok();
+        let inside = if let Some(path) = location.as_deref() {
+            Path::new(path).starts_with(&root)
+        } else {
+            // Unrelated unresolved cwds are harmless, but a known descendant of
+            // either spelling still belongs here after deletion/inaccessibility.
+            Path::new(cwd).starts_with(raw) || Path::new(cwd).starts_with(&root)
+        };
+        locations.insert(cwd.to_owned(), location.map_or(Value::Bool(false), Value::String));
+        if inside && (agent.state == "working" || agent.state == "waiting_input"
             || (req.removing == Some(true) && agent.live)) {
             bail!("{}", if req.removing == Some(true) {
                 "An agent is still live here. Close its tab before removing this workspace."
             } else { "An agent is working or waiting for you here. Finish or stop it before applying." });
         }
     }
+    c["agent_locations"] = Value::Object(locations);
     Ok(c)
 }
 fn removal_details(req: &Request, c: &Value) -> Result<Value> {
@@ -301,6 +327,8 @@ pub fn dispatch(db: &Path, req: Request) -> Result<Value> {
         },
         "save-before-remove" => {
             let info = removal_details(&req, &c)?;
+            ensure!(info["commits"]["head"].is_string(),
+                "The checked-out branch has no commits yet. Switch the workspace to a retained branch containing these commits, then use Save branch.");
             save_branch(&c, req.branch.as_deref().context("new branch required")?)?;
             let current = checkout(&req)?;
             let after = details(&current)?;

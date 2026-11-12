@@ -543,3 +543,82 @@ fn failed_folder_change_rolls_back_retained_membership() {
     assert_eq!(uids(&project(&snap, &id)["sessions"]), ["omp:original"]);
     assert_eq!(conn.query_row("SELECT count(*) FROM project_chats", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
 }
+
+#[test]
+fn recents_scope_to_the_panel_folder_like_worktree_search() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db = temp.path().join("index.sqlite");
+    let repo = home.join("repo");
+    let sub = repo.join("sub");
+    let other = home.join("other");
+    let empty = home.join("empty");
+    for folder in [&sub, &other, &empty, &repo.join(".git")] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    // A repository marker is enough for Worktree scope: chats started in `repo` and in
+    // `repo/sub` share one worktree root without running Git.
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    for i in 0..10 {
+        seed(&home, &format!("root{i}"), &repo, 100 + i);
+        seed(&home, &format!("sub{i}"), &sub, 200 + i);
+    }
+    for i in 0..3 {
+        seed(&home, &format!("other{i}"), &other, 300 + i);
+    }
+    run(&db, &home, &["index"]);
+    let recents = |cwd: Option<&Path>| -> Vec<String> {
+        let mut request = json!({"op":"snapshot","view":"mine","per":25,"recent":15});
+        if let Some(cwd) = cwd {
+            request["recent_cwd"] = json!(cwd);
+        }
+        library(&db, &home, request)["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["uid"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // Absent `recent_cwd` keeps the global newest-first list, capped at 15.
+    let all = recents(None);
+    assert_eq!(all.len(), 15);
+    assert_eq!(all.first().map(String::as_str), Some("omp:other2"));
+    assert!(all.iter().any(|uid| uid == "omp:other0"));
+    // This folder keeps the 15 newest chats under the repository worktree, including
+    // chats started in its subfolders, exactly as Search's Worktree scope does.
+    let scoped = recents(Some(&sub));
+    assert_eq!(scoped.len(), 15);
+    assert!(scoped
+        .iter()
+        .all(|uid| uid.starts_with("omp:sub") || uid.starts_with("omp:root")));
+    assert_eq!(scoped.first().map(String::as_str), Some("omp:sub9"));
+    let search = run(
+        &db,
+        &home,
+        &[
+            "query",
+            "--scope",
+            "workspace",
+            "--cwd",
+            sub.to_str().unwrap(),
+            "--limit",
+            "15",
+            "--q",
+            "",
+        ],
+    );
+    assert_eq!(scoped, uids(&search["sessions"]));
+    assert_eq!(
+        recents(Some(&other)),
+        ["omp:other2", "omp:other1", "omp:other0"]
+    );
+    assert!(recents(Some(&empty)).is_empty());
+    // Archived chats stay out of both scopes, and the global list still hides them.
+    library(
+        &db,
+        &home,
+        json!({"op":"chat-update","uid":"omp:sub9","archived":true}),
+    );
+    assert_eq!(recents(Some(&sub)).first().map(String::as_str), Some("omp:sub8"));
+    assert!(!recents(None).iter().any(|uid| uid == "omp:sub9"));
+}

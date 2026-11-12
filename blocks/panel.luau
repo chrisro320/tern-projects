@@ -9,6 +9,7 @@ local editor = require("../lib/project-editor")
 local picker = require("../lib/picker")
 local c = require("../lib/ui")
 local updates = require("../lib/updates")
+local workspaces = require("../lib/workspaces")
 
 local PAGE = 150 -- rendered list rows; Tern virtualizes (and unwires row actions) past 200
 local SEARCH_PAGE = 50
@@ -252,6 +253,10 @@ local function mutate(s: any, payload: any, done: ((any) -> ())?, on_err: ((stri
 	end)
 end
 reload = function(s: any)
+	if s.mode == "workspaces" then
+		workspaces.library_changed(s)
+		return
+	end
 	s.gen += 1
 	local gen = s.gen
 	local function accept(data: any, err: string?)
@@ -300,6 +305,7 @@ reload = function(s: any)
 end
 local function refresh(s: any)
 	reload(s)
+	if s.mode == "workspaces" then return end
 	if s.indexing or not live(s) then return end
 	s.indexing = true
 	cli.run({"index"}, cli.TIMEOUT_INDEX, function(_, err)
@@ -955,6 +961,7 @@ local function find_chat(s: any, key: string): any
 end
 local function enter_search(s: any)
 	cancel_flow(s)
+	if s.mode == "workspaces" then workspaces.leave(s) end
 	s.mode = "search"; s.page = 0; s.offset = 0; s.sel = nil; s.loaded = false
 	rebuild(s); reload(s)
 	s.cx:frame({{"focus", SEARCH_FIELD}})
@@ -1001,6 +1008,7 @@ local function change_mode(s: any, mode: string)
 		return
 	end
 	cancel_flow(s)
+	if s.mode == "workspaces" then workspaces.leave(s) end
 	s.mode = mode; s.page = 0; s.settings_focus = nil
 	if mode == "settings" then watch_shortcuts(s) end
 	rebuild(s); reload(s)
@@ -1403,6 +1411,7 @@ local function nav_view(s: any, narrow: boolean): any
 	return ui.el("div", {key = "nav", class = "tp-top"}, {
 		c.seg({
 			{id = "projects", label = "Projects", icon = "folder", title = "Projects (Tab)"},
+			{id = "workspaces", label = "Workspaces", icon = "branch", title = "OVNFS Workspaces (Tab)"},
 			{id = "search", label = "Search", icon = "search", title = "Search chats (/)"},
 			{id = "settings", label = "Settings", icon = "gear", title = "Settings"},
 		}, s.mode, "mode", {class = "tp-nav", icons_only = narrow}),
@@ -1652,7 +1661,7 @@ local function settings_view(s: any): any
 	end
 	local shortcuts = {
 		{"Search from Projects / Settings", {"/"}},
-		{"Cycle Mine / Discovered / Search / Settings", {"tab"}},
+		{"Cycle Mine / Discovered / Workspaces / Search / Settings", {"tab"}},
 		{"Cycle views backwards", {"shift", "tab"}},
 		{"Move selection", {"up", "down"}},
 		{"Move 10 rows / cross result pages", {"page_up", "page_down"}},
@@ -1832,6 +1841,10 @@ local function layer_view(s: any): any?
 	if s.picker then return ui.col({picker.view(s.picker, s.busy)}) end
 	local kids: {any} = {}
 	if s.preview and s.mode ~= "settings" then table.insert(kids, preview_view(s)) end
+	if s.mode == "workspaces" then
+		local layer = workspaces.layer(s)
+		if layer then table.insert(kids, layer) end
+	end
 	if s.confirm then table.insert(kids, confirm_view(s)) elseif s.menu then table.insert(kids, menu_view(s)) end
 	return if #kids > 0 then ui.col(kids) else nil
 end
@@ -1841,7 +1854,13 @@ end
 local panel: BlockDef<any> = {
 	init = function(cx, args, saved)
 		local s: any = {cx = cx, mode = args and args[1] or "projects", ctx_cwd = args and args[2] or "", view = "mine", projects = {}, pinned = {}, recent = {}, expanded = {}, more = {}, settings = {icon_style = "color"}, query = tf.new(""), query_all = false, scope = "all", sort = "updated", results = {}, total = 0, offset = 0, page = 0, rows = {}, order = {}, gen = 0, tokens = {}, alive = true, busy = false, indexing = false, loaded = false, archived = {}, launch_pending = false, launch_slow = false, launch_wait_seq = 0}
+		workspaces.init(s, live, function(state: any, cwd: string)
+			cancel_flow(state)
+			state.launch_target = {cwd = cwd, label = fmt.basename(cwd), folders = 1}
+			launch_plan(state, "omp", false)
+		end)
 		if saved then
+			if saved.mode == "workspaces" then s.mode = "workspaces" end
 			if saved.view == "mine" or saved.view == "discovered" then s.view = saved.view end
 			if saved.scope == "workspace" or saved.scope == "repository" or saved.scope == "all" then s.scope = saved.scope end
 			if saved.sort == "updated" or saved.sort == "relevance" then s.sort = saved.sort end
@@ -1877,7 +1896,7 @@ local panel: BlockDef<any> = {
 	save = function(s) return {mode = s.mode, view = s.view, query = s.query.text, scope = s.scope, sort = s.sort} end,
 	-- Width-dependent layout (row previews, icon-only controls) must follow pane resizes.
 	resize = function(s, cols, _rows, _cx) s.cols = cols end,
-	title = function(s) return if s.mode == "projects" then "Projects" elseif s.mode == "search" then "Projects · Search" else "Projects · Settings" end,
+	title = function(s) return if s.mode == "projects" then "Projects" elseif s.mode == "search" then "Projects · Search" elseif s.mode == "workspaces" then "Projects · Workspaces" else "Projects · Settings" end,
 	view = function(s, cx)
 		-- `cx.cols` is a placeholder until the pane reports a resize; only trust reported widths.
 		local cols = s.cols or 44
@@ -1902,6 +1921,8 @@ local panel: BlockDef<any> = {
 		if s.busy and not s.editor and not s.picker and not s.confirm then table.insert(children, c.banner("busy", "info", nil, (s.busy_label or "Working…") .. " The change is continuing.", nil, true)) end
 		if s.mode == "settings" then
 			table.insert(children, settings_view(s))
+		elseif s.mode == "workspaces" then
+			for _, node in workspaces.view(s) do table.insert(children, node) end
 		else
 			if s.mode == "projects" then table.insert(children, projects_bar(s, cols))
 			else for _, n in search_bar(s) do table.insert(children, n) end end
@@ -1913,7 +1934,7 @@ local panel: BlockDef<any> = {
 		end
 		local result: any = {main = ui.col(children)}
 		-- The drawer shows the selected chat, so the dock it would cover is left out.
-		if s.mode ~= "settings" and not s.preview then result.dock = dock_view(s) end
+		if s.mode ~= "settings" and s.mode ~= "workspaces" and not s.preview then result.dock = dock_view(s) end
 		result.layer = layer_view(s)
 		return result
 	end,
@@ -1945,9 +1966,10 @@ local panel: BlockDef<any> = {
 		if s.confirm then return confirm_key(s, k) end
 		if s.menu then return menu_key(s, k) end
 		if k.name == "escape" and s.preview and s.mode ~= "settings" then close_preview(s); return true end
+		if s.mode == "workspaces" and workspaces.key(s, k) then return true end
 		local name = k.name
 		if name == "tab" then
-			local stops = {"mine", "discovered", "search", "settings"}
+			local stops = {"mine", "discovered", "workspaces", "search", "settings"}
 			local current = if s.mode == "projects" then s.view else s.mode
 			local i = table.find(stops, current) or 1
 			local next = stops[(i - 1 + (if k.shift then -1 else 1)) % #stops + 1]
@@ -1996,6 +2018,7 @@ local panel: BlockDef<any> = {
 	end,
 	event = function(s, ev, cx)
 		local id, name = ev.id or "", ev.ev
+		if workspaces.event(s, ev) then cx:render(); return end
 		if name == "action" and ev.act == "shortcut-state" then
 			if s.mode ~= "settings" or s.shortcut_payload == ev.value then return end
 			local ok, data = pcall(tern.json.decode, ev.value or "")

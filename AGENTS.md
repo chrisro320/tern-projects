@@ -18,6 +18,7 @@ Prerequisites: Tern, stable Rust, and the check tools listed below. Run commands
 cargo test --locked --manifest-path indexer/Cargo.toml # Backend unit and integration tests
 cargo clippy --locked --manifest-path indexer/Cargo.toml --all-targets -- -D clippy::correctness -D clippy::suspicious
 python3 scripts/check-luau.py                          # Requires luau-compile 0.745
+python3 scripts/test-workspace-agents.py               # Requires Luau; native-state/result lifecycle, no model
 actionlint                                           # Requires actionlint 1.7.12
 shellcheck scripts/*.sh                              # Requires ShellCheck 0.11.0
 tern plugin types .                                  # Regenerate tern.d.luau after Tern updates
@@ -37,9 +38,10 @@ tern plugin reload                                   # Reload plugin in running 
 | --- | --- |
 | `host.luau` | Host process: start update checks, register the panel, manage shared state. |
 | `window.luau` | Window process: shortcuts, native settings, toggles, `tern-projects://launch` and `tern-projects://resume` routes. |
-| `blocks/panel.luau`, `styles.css` | Projects, Search, and Settings UI. |
+| `blocks/panel.luau`, `styles.css` | Projects, Workspaces, Search, and Settings UI. |
 | `lib/backend.luau`, `lib/cli.luau` | Cargo builds, binary cache, request queue, CLI JSON, deletion/update coordination. |
 | `lib/updates.luau` | Host-only update checks, consent-gated installation, recovery. |
+| `lib/workspaces.luau`, `lib/workspace-agents.luau`, `indexer/src/workspaces.rs` | Workspaces UI/request pool, window-native agent/result bridge, and the sole OVNFS/Git management adapter. |
 | `lib/input.luau`, `lib/textfield.luau` | Shortcuts, UTF-16 native edits, UTF-8 text fields. |
 | `lib/ui.luau`, `lib/picker.luau`, `lib/project-editor.luau`, `lib/fmt.luau` | Shared widgets, selection sheets, project drafts/directory browser, formatting. |
 | `indexer/src/main.rs`, `indexer/src/model.rs`, `indexer/src/text.rs`, `indexer/src/git.rs` | CLI entry, data types, quoting/timestamps, Git/worktree resolution. |
@@ -79,6 +81,12 @@ For a new harness, follow [docs/adding-a-harness.md](docs/adding-a-harness.md) r
 - Pending installation status survives reload. On disk-confirmed success, persist `completed_version` and remove pending state. `window.luau` delivers the **Updated!** toast after reload without a panel, acknowledging it under `plugin-update-toast:v1`; the window must not rewrite host-owned updater preferences.
 - At startup, clear a saved installation failure only when the installed version reaches its target `latest_version`. Keep check failures with no target and failures targeting newer versions.
 - A shared host guard excludes installation and active permanent deletion, including queued deletions that become ready during installation. Update checks never modify the library/index.
+
+## Workspace safety
+
+- OVNFS owns checkout state; Projects owns curated folders. Poll only the Workspaces view, probe `status` before `ls` (which otherwise auto-starts), inherit daemon environment, and never use `dirty` for source-change counts. Cache details by checkout identity, touched and daemon pid; cap management requests at three.
+- Re-read native agents immediately before mutations: working/waiting blocks Apply, any live agent blocks removal. Check identities and fresh preview/detail tokens in the backend. Apply conflicts are successful structured results, never automatic retries.
+- Workspace mutations use a separate OS-held lock, retained by the CLI across plugin reloads, not an operation journal. Re-read state after reload and do not replay. Branch preservation refuses existing refs; removal warns about excluded files and unreturned commits. Only explicitly confirmed OVNFS checkout removal is allowed; never delete source folders.
 
 ## Deletion safety
 

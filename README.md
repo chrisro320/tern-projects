@@ -62,6 +62,7 @@ If you use multiple AI coding agents, your sessions are scattered across hidden 
 - 📌 **Global Pins & Recents** — Keep critical threads pinned to the top of your sidebar. Recents keeps your 15 most recent chats one click away.
 - 👁️ **Read-only Chat Preview** — Select an OMP or Claude Code chat and choose **Preview** (or press `Space` in Projects) to read it in a drawer inside the panel without starting the agent: your messages on the right, the agent's on the left, tool calls condensed to one line, the newest part of long chats. The drawer follows your selection; `Esc`, `Space` or its close button closes it.
 - 🗄️ **Local Archiving & Safe Deletion** — Archive threads to hide them without losing data, or permanently delete sessions via verified native CLI calls.
+- **OVNFS Workspaces** — A Workspaces tab in the existing Projects panel: curated project → folder → checkout/fork → native Tern agents. Create, fork, open a fresh OMP, preview/apply source changes, preserve commits as a new branch, or explicitly remove a checkout.
 
 Changing a project's name or source folders does not discard its existing indexed chats. When source folders change, existing automatic memberships (including archived chats) are retained in the durable library; project lists and scoped search keep using them after an index rebuild. New chats still follow the configured folders, so reusing an old path does not attach unrelated new chats. Explicit **Move to project** and **No project** choices take precedence. Original transcripts and their recorded working directories are not rewritten.
 
@@ -70,6 +71,20 @@ For chats already hidden by a folder change made before this fix, find them in *
 ![tern-projects details, menus, and search results](docs/screenshots/showcase-details.png)
 
 ---
+## OVNFS Workspaces
+
+Install [OVNFS](https://github.com/stencil-hq/ovnfs) on the host, open **Projects → Workspaces**, and use **Add project** to choose one or more source folders (Git is optional). Click a folder for **New workspace**, or a checkout for its actions. This uses Projects' existing **Mine** library, not a second project list. Names are globally unique, start with a lowercase letter or number, and contain at most 64 lowercase letters, numbers, dots, underscores or hyphens.
+
+The tab checks OVNFS every two seconds while open. Missing binary, stopped daemon and command errors are distinct; only the explicit **Start** button starts the default daemon. `OVNFS_STATE` and `OVNFS_MOUNT` are inherited. At most three management requests run concurrently. Source-change counts come from `ovnfs diff`, **not** its `dirty` flag, and are refreshed after touched/pid changes or plugin operations, including snapshots, forks and daemon restarts.
+
+Agent states come from Tern, including agents launched outside Projects. Click a state row to reveal its pane. Finished results are recorded only from Tern's `agent_finished` events in plugin KV, retained across reopen/reload until the agent restarts or its tab is viewed; unknown results are idle. Waiting/completion notifications use Tern's existing notifications, without duplicate plugin toasts. **Open new OMP** uses the existing verified fresh-chat launch path, never resumes a conversation and never submits a prompt.
+
+**Apply** first shows a dry-run preview and target folder, then requires confirmation. Results separate applied/merged files, conflict markers, and files left untouched. Exit code 1 with conflict JSON is a normal partial-merge result, not a retry. Source-only edits are retained. Working or waiting agents block Apply; any live agent blocks removal. Revalidated checkout identities and confirmation tokens reject changed/reused workspaces. An OS-held backend guard survives plugin reloads: the tab re-reads state, blocks concurrent mutations and never automatically replays an operation.
+
+The commit badge compares checkout HEAD with the source's current HEAD (`rev-list --count <source-tip>..HEAD`). Click **Show source changes / commits** for the newest 25 titles. Plain Apply copies working-tree changes, **not commits**. **Save commits as branch** requires a new branch name and leaves the source working tree alone; an existing branch (especially the checked-out one) is refused. Removal warns that ignored files, caches and files over 100 MB are deleted too, even though source-change counts exclude them. Unreturned commits can be saved to a new source-repo branch before removal. No Worktrunk, OMP extension, settings edit, task or review integration is required.
+
+---
+
 
 ## Keyboard-First Controls
 
@@ -79,7 +94,7 @@ Default controls are listed below. Tern’s preset and your overrides can change
 |---|---|---|
 | **Toggle Projects sidebar** | `⌘ ⌥ S` | `Ctrl + Alt + S` |
 | **Search everywhere** | `⌃ ⌥ ⌘ S` | `Ctrl + Alt + Shift + S` |
-| **Cycle views** (Projects ➔ Found ➔ Search ➔ Settings) | `Tab` / `Shift + Tab` | `Tab` / `Shift + Tab` |
+| **Cycle views** (Mine ➔ Found ➔ Workspaces ➔ Search ➔ Settings) | `Tab` / `Shift + Tab` | `Tab` / `Shift + Tab` |
 | **Quick Search** from Projects or Settings | `/` | `/` |
 | **New chat** (in current project/folder) | `⌘ N` | `Ctrl + N` |
 | **New chat with…** (choose harness) | `⇧ ⌘ N` | `Shift + Ctrl + N` |

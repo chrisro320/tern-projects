@@ -8,6 +8,7 @@ end
 local fmt = require("./lib/fmt")
 local unpct = fmt.unpct
 local pct = fmt.pct
+require("./lib/workspace-agents").start()
 
 local KIND = "tern-projects.panel"
 local WIDTH = 44

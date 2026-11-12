@@ -323,6 +323,37 @@ local function copy(s: any, text: string, what: string)
 	toast(s, "success", "Copied " .. what)
 end
 
+-- Chat preview -------------------------------------------------------------------------------
+-- The window shows the read-only transcript beside the panel; while open it follows the selection.
+local PREVIEW_DELAY = 150 -- ms; arrowing through the list sends only the chat it settles on
+local function previewable(chat: any): boolean
+	return chat ~= nil and (chat.agent == "omp" or chat.agent == "claude")
+end
+-- `follow`: a selection change, which only updates an open preview; otherwise the user asked to open one.
+-- `s.preview_uid` is set only when the window reports the chat shown: an update dropped because focus
+-- left the panel during the delay is sent again on the next input.
+local function send_preview(s: any, chat: any, follow: boolean)
+	s.preview_seq = (s.preview_seq or 0) + 1
+	local seq = s.preview_seq
+	local function go()
+		if not live(s) or not s.preview or s.preview_seq ~= seq then return end
+		s.cx:open("tern-projects://preview?uid=" .. fmt.pct(chat.uid) .. (if follow then "&follow=1" else ""))
+	end
+	if follow then tern.timer(PREVIEW_DELAY, go) else go() end
+end
+local function start_preview(s: any, chat: any)
+	if not previewable(chat) then toast(s, "info", "Preview is available for OMP and Claude Code chats"); return end
+	s.preview = true
+	send_preview(s, chat, false)
+end
+local function follow_preview(s: any)
+	if not s.preview then return end
+	local row = s.rows[s.sel or ""]
+	-- Other harnesses still replace the shown chat, with the backend's "not available" notice.
+	if not row or row.kind ~= "session" or row.ref.uid == s.preview_uid then return end
+	send_preview(s, row.ref, true)
+end
+
 -- Project editor -------------------------------------------------------------------------
 
 local function focus_editor_field(s: any)
@@ -772,7 +803,9 @@ local function menu_entries(s: any, key: string): {string}
 	local row = s.rows[key]
 	if not row then return {} end
 	if row.kind == "session" then
-		return {"resume", "copy-resume-command", "copy-chat-id", "-", if row.ref.pinned then "unpin" else "pin", "move-to-project…", if row.ref.archived then "restore" else "archive", "-", if s.mode == "search" then "search-options" else "panel-options", "-", "delete-permanently…"}
+		local ids = {"resume", "copy-resume-command", "copy-chat-id", "-", if row.ref.pinned then "unpin" else "pin", "move-to-project…", if row.ref.archived then "restore" else "archive", "-", if s.mode == "search" then "search-options" else "panel-options", "-", "delete-permanently…"}
+		if previewable(row.ref) then table.insert(ids, 2, "preview") end
+		return ids
 	elseif row.kind == "project" then
 		if s.view == "mine" then return {"new-chat", "new-chat-with…", "-", "edit-project…", "remove-project…", "-", "panel-options"} end
 		return {"new-chat", "new-chat-with…", "-", "save-as-project…", "-", "panel-options"}
@@ -786,6 +819,7 @@ local function menu_ids(s: any, key: string): {string}
 end
 local MENU_META: {[string]: any} = {
 	["resume"] = {label = "Resume", icon = "play", hint = {"enter"}},
+	["preview"] = {label = "Preview", icon = "eye"},
 	["copy-resume-command"] = {label = "Copy resume command", icon = "copy", hint = {"ctrl", "y"}},
 	["copy-chat-id"] = {label = "Copy chat ID", icon = "hash"},
 	["pin"] = {label = "Pin", icon = "pin"},
@@ -1128,6 +1162,7 @@ local function confirm_action(s: any, id: string)
 end
 local function chat_action(s: any, act: string, chat: any)
 	if act == "resume" then resume(s, chat)
+	elseif act == "preview" then start_preview(s, chat)
 	elseif act == "copy-resume-command" then copy(s, chat.resume and chat.resume.command or "", "resume command")
 	elseif act == "copy-chat-id" then copy(s, chat.id or chat.uid, "chat ID")
 	elseif act == "pin" or act == "unpin" then
@@ -1241,9 +1276,12 @@ action = function(s: any, act: string, value: string?)
 			mutate(s, {op = "settings-update", icon_style = style}, nil, function() s.settings.icon_style = previous end)
 		end
 	elseif act == "archived" then s.settings_focus = "archived"; archived_picker(s)
-	elseif act == "resume" or act == "copy-resume-command" or act == "copy-chat-id" then
+	elseif act == "resume" or act == "preview" or act == "copy-resume-command" or act == "copy-chat-id" then
 		-- Native menus name the clicked row; the dock and shortcuts act on the selection.
-		local chat = find_chat(s, if value then fmt.unpct(value) else (s.sel or ""))
+		local key = if value then fmt.unpct(value) else (s.sel or "")
+		-- A preview follows the selection, so previewing a clicked row selects it.
+		if act == "preview" and s.rows[key] then s.sel = key end
+		local chat = find_chat(s, key)
 		if chat then chat_action(s, act, chat) end
 	elseif act == "edit-selected" then
 		local row = s.rows[s.sel or ""]
@@ -1589,6 +1627,7 @@ local function settings_view(s: any): any
 		{"Move 10 rows / cross result pages", {"page_up", "page_down"}},
 		{"Expand / collapse project", {"left", "right"}},
 		{"Resume chat / toggle project", {"enter"}},
+		{"Preview chat (Projects)", {"space"}},
 		{"Actions / search or panel options", {"shift", "f10"}},
 		{"New chat", {mod, "n"}},
 		{"New chat with…", {"shift", mod, "n"}},
@@ -1653,11 +1692,14 @@ local function dock_view(s: any): any?
 		if type(r.last_assistant) == "string" and r.last_assistant ~= "" then
 			table.insert(kids, ui.node("text", {text = r.last_assistant, lines = 2, role = "tern-projects.dock-preview"}))
 		end
-		table.insert(kids, ui.el("div", {class = "tp-dock-a"}, {
-			c.button("Resume", "resume", {variant = "primary", size = "sm", icon = "play", title = "Resume (⏎)"}),
-			if narrow then c.icon_button("copy", "copy-resume-command", "Copy resume command (Ctrl+Y)", {size = "sm"}) else c.button("Copy command", "copy-resume-command", {size = "sm", icon = "copy", title = "Copy resume command (Ctrl+Y)"}),
-			c.icon_button("more", "actions", "More actions (⇧F10)", {size = "sm"}),
-		}))
+		local buttons = {c.button("Resume", "resume", {variant = "primary", size = "sm", icon = "play", title = "Resume (⏎)"})}
+		if previewable(r) then
+			local hint = if s.mode == "projects" then "Preview (Space)" else "Preview"
+			table.insert(buttons, if narrow then c.icon_button("eye", "preview", hint, {size = "sm"}) else c.button("Preview", "preview", {size = "sm", icon = "eye", title = hint}))
+		end
+		table.insert(buttons, if narrow then c.icon_button("copy", "copy-resume-command", "Copy resume command (Ctrl+Y)", {size = "sm"}) else c.button("Copy command", "copy-resume-command", {size = "sm", icon = "copy", title = "Copy resume command (Ctrl+Y)"}))
+		table.insert(buttons, c.icon_button("more", "actions", "More actions (⇧F10)", {size = "sm"}))
+		table.insert(kids, ui.el("div", {class = "tp-dock-a"}, buttons))
 	else
 		local mine = s.view == "mine"
 		local folders = if mine then (r.folders or {}) else {r.root}
@@ -1855,6 +1897,8 @@ local panel: BlockDef<any> = {
 		if name == "enter" then activate(s, s.sel); return true end
 		if name == "y" and k.ctrl then action(s, "copy-resume-command", nil); return true end
 		if s.mode == "projects" then
+			-- Space previews here only: in Search it types into the query.
+			if name == "space" then action(s, "preview", nil); return true end
 			if name == "left" or name == "right" then
 				local row = s.rows[s.sel or ""]
 				if row and row.kind == "project" then s.expanded[s.sel] = name == "right"; rebuild(s)
@@ -1879,6 +1923,8 @@ local panel: BlockDef<any> = {
 	end,
 	event = function(s, ev, cx)
 		local id, name = ev.id or "", ev.ev
+		if name == "action" and ev.act == "preview-closed" then s.preview = false; s.preview_uid = nil; return end
+		if name == "action" and ev.act == "preview-shown" then s.preview_uid = ev.value; return end
 		if name == "action" and ev.act == "shortcut-state" then
 			if s.mode ~= "settings" or s.shortcut_payload == ev.value then return end
 			local ok, data = pcall(tern.json.decode, ev.value or "")
@@ -1959,4 +2005,16 @@ local panel: BlockDef<any> = {
 		cx:render()
 	end,
 }
+
+-- An open preview follows the selection, whichever input moved it.
+local handle_key, handle_event = panel.key, panel.event
+panel.key = function(s, k, cx)
+	local handled = handle_key(s, k, cx)
+	follow_preview(s)
+	return handled
+end
+panel.event = function(s, ev, cx)
+	handle_event(s, ev, cx)
+	follow_preview(s)
+end
 return panel

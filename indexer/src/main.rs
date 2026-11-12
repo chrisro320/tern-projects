@@ -17,6 +17,7 @@ mod library;
 mod sessions;
 mod harnesses;
 mod delete;
+mod transcript;
 
 use adapters::Adapter;
 use anyhow::{Context, Result};
@@ -324,6 +325,7 @@ fn run_library(db_path: &Path, home: &Path) -> Result<serde_json::Value> {
         Request::Delete { uid, expected_source, expected_version } => {
             delete::execute(db_path, home, &uid, &expected_source, &expected_version)
         }
+        Request::Transcript { uid } => transcript::preview(db_path, home, &uid),
     }
 }
 

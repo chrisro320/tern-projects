@@ -61,6 +61,9 @@ pub enum Request {
         expected_source: String,
         expected_version: String,
     },
+    Transcript {
+        uid: String,
+    },
 }
 
 // Option<Value> cannot distinguish an absent field from an explicit JSON null.

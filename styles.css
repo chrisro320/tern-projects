@@ -393,3 +393,35 @@
 		[data-role="tern-projects.rows"] .sf-item::before { transition: none; }
 	}
 }
+
+/* Chat preview canvas, owned by the window rather than the panel surface: your turns right, the agent's left. */
+.tp-chat {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	padding: 12px 14px 24px;
+	font-family: var(--sans);
+	font-size: 13px;
+	color: var(--t1);
+}
+.tp-chat-meta { align-self: center; font-size: 11.5px; color: var(--t3); }
+.tp-chat-msg {
+	max-width: 85%;
+	min-width: 0;
+	padding: 8px 12px;
+	border-radius: 12px;
+	overflow-wrap: anywhere;
+}
+.tp-chat-msg.user {
+	align-self: flex-end;
+	border-bottom-right-radius: 4px;
+	background: rgb(from var(--accent) r g b / 16%);
+}
+.tp-chat-msg.agent {
+	align-self: flex-start;
+	border-bottom-left-radius: 4px;
+	background: var(--card);
+	box-shadow: 0 0 0 1px var(--l2);
+}
+.tp-chat-who { margin-bottom: 4px; font-size: 11px; font-weight: 600; color: var(--t3); }
+.tp-chat-msg.user .tp-chat-who { text-align: right; }

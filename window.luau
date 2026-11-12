@@ -6,7 +6,6 @@ if tern.runtime.os == "ios" then
 end
 
 local fmt = require("./lib/fmt")
-local cli = require("./lib/cli")
 local unpct = fmt.unpct
 local pct = fmt.pct
 
@@ -17,11 +16,6 @@ local LAUNCH_CLAIM_LIFETIME = 10 -- seconds; must match the panel's one-shot cla
 -- Per-pane state for toggle tracking.
 local last_mode: { [number]: string } = {}
 local prev_focus: { [number]: number } = {}
--- Chat previews: one read-only canvas per Projects panel, showing only its newest request.
-local previews: { [number]: number } = {}
-local preview_latest: { [number]: number } = {}
-local preview_counter = 0
-local PREVIEW_ABOUT = "Read-only preview of a chat from the Projects panel. Selecting another chat there switches it; closing this pane stops previewing."
 
 -- Look a pane up through the window's pane list: cx.session:pane(id) can return nil for a live pane.
 local function find_pane(cx: SessionContext, id: number?): PaneInfo?
@@ -107,127 +101,6 @@ local function toggle(cx: SessionContext, mode: string)
 		if c ~= nil and c > WIDTH + 2 then
 			cx2.layout:resize(new_pane :: number, "right", -(c - WIDTH))
 		end
-	end)
-end
-
--- Canvas titles hold at most 80 characters.
-local function preview_title(title: string): string
-	local n = utf8.len(title)
-	if n ~= nil and n <= 80 then return title end
-	local cut = utf8.offset(title, 80)
-	return if cut ~= nil then string.sub(title, 1, cut - 1) .. "…" else "Chat preview"
-end
-
--- Open beside the pane the panel was opened from, so the preview sits between the list and the work.
-local function preview_target(cx: any, panel: number, tab: number): (number, Dir)
-	local fallback: number? = nil
-	for _, p in cx.session:panes() do
-		if p.tab == tab and p.pane ~= panel and p.pane ~= previews[panel] then
-			if p.pane == prev_focus[panel] then return p.pane, "left" end
-			if fallback == nil then fallback = p.pane end
-		end
-	end
-	if fallback ~= nil then return fallback, "left" end
-	return panel, "right"
-end
-
--- Pane ids alone can go stale (`tern close` sends no pane_closed); confirm the pane is still one of our previews.
-local function is_preview(cx: any, pane: number?): boolean
-	if pane == nil then return false end
-	local info = cx.canvas:get(pane)
-	return info ~= nil and info.owner == tern.plugin.id and info.about == PREVIEW_ABOUT
-end
-
--- A reload restarts every panel without its preview; close previews left from before it.
-tern.timer(0, function(cx: any?)
-	if cx == nil then return end
-	for _, info in cx.canvas:list() do
-		if info.owner == tern.plugin.id and info.about == PREVIEW_ABOUT then
-			pcall(function() cx.layout:close(info.pane) end)
-		end
-	end
-end)
-
--- Chat layout: your messages on the right, the agent's on the left.
-local function preview_view(data: any): any
-	local ui = tern.ui
-	local label = if type(data.label) == "string" then data.label else "Agent"
-	local kids: { any } = { ui.el("div", { key = "meta", class = "tp-chat-meta", text = label .. " · " .. tostring(data.cwd or "") }) }
-	local hidden = tonumber(data.hidden) or 0
-	if hidden > 0 then
-		table.insert(kids, ui.el("div", { key = "hidden", class = "tp-chat-meta", text = string.format("%d earlier message%s omitted", hidden, if hidden == 1 then "" else "s") }))
-	end
-	for i, turn in data.turns do
-		local user = turn.role == "user"
-		table.insert(kids, ui.el("div", { key = "t" .. tostring(i), class = "tp-chat-msg " .. (if user then "user" else "agent") }, {
-			ui.el("div", { class = "tp-chat-who", text = if user then "You" else label }),
-			ui.md(turn.markdown),
-		}))
-	end
-	if #data.turns == 0 then table.insert(kids, ui.el("div", { key = "empty", class = "tp-chat-meta", text = "No messages to show." })) end
-	return ui.el("div", { class = "tp-chat" }, kids)
-end
-
-local function error_view(err: string): any
-	local ui = tern.ui
-	return ui.el("div", { class = "tp-chat" }, {
-		ui.el("div", { class = "tp-chat-meta", text = "Cannot preview this chat." }),
-		ui.el("div", { class = "tp-chat-msg agent", text = fmt.error(err) }),
-	})
-end
-
-local function notify_panel(cx: any, panel: number, act: string, value: string?)
-	if find_pane(cx, panel) ~= nil then
-		pcall(function() cx.session:event(panel, { ev = "action", id = "main", act = act, value = value }) end)
-	end
-end
-
-local function stop_following(cx: any, panel: number)
-	previews[panel] = nil
-	preview_latest[panel] = nil
-	notify_panel(cx, panel, "preview-closed")
-end
-
--- `follow` updates come from selection changes: they never reopen a preview the user closed.
--- The panel learns which chat is shown only from here, so a dropped update is retried.
-local function show_preview(cx: any, panel: number, uid: string, title: string, view: any, follow: boolean)
-	local origin = find_pane(cx, panel)
-	if origin == nil then return end
-	local current = previews[panel]
-	if current ~= nil and not is_preview(cx, current) then current = nil end
-	if current ~= nil then
-		local ok, err = pcall(function() cx.canvas:set(current, { title = preview_title(title), view = view }) end)
-		if ok then previews[panel] = current; notify_panel(cx, panel, "preview-shown", uid); return end
-		tern.log.error("Cannot update chat preview: " .. tostring(err))
-	end
-	if follow then stop_following(cx, panel); return end
-	local target, dir = preview_target(cx, panel, origin.tab)
-	local ok, pane, err = pcall(function()
-		return cx.canvas:open({ title = preview_title(title), view = view, about = PREVIEW_ABOUT, target = target, dir = dir, ratio = 0.5, focus = false })
-	end)
-	if not ok or pane == nil then
-		cx:toast("error", "Cannot open chat preview", tostring(if ok then err else pane))
-		return
-	end
-	previews[panel] = pane
-	notify_panel(cx, panel, "preview-shown", uid)
-end
-
-local function request_preview(panel: number, uid: string, follow: boolean)
-	preview_counter += 1
-	local seq = preview_counter
-	preview_latest[panel] = seq
-	cli.request({ op = "transcript", uid = uid }, function(data: any?, err: string?)
-		if preview_latest[panel] ~= seq then return end
-		-- The backend reply carries no window context; take one on the next tick.
-		tern.timer(0, function(cx: any?)
-			if cx == nil or preview_latest[panel] ~= seq then return end
-			if err ~= nil or type(data) ~= "table" or type(data.turns) ~= "table" then
-				show_preview(cx, panel, uid, "Chat preview", error_view(err or "The backend returned no transcript."), follow)
-			else
-				show_preview(cx, panel, uid, if type(data.title) == "string" and data.title ~= "" then data.title else "Chat preview", preview_view(data), follow)
-			end
-		end)
 	end)
 end
 
@@ -321,20 +194,9 @@ tern.command({
 })
 
 -- Clean up tracking state when a pane closes.
-tern.on("pane_closed", function(ev: any, cx: any)
+tern.on("pane_closed", function(ev: any, _cx: any)
 	last_mode[ev.pane] = nil
 	prev_focus[ev.pane] = nil
-	-- A closed preview stops following the panel's selection.
-	for panel, pane in previews do
-		if pane == ev.pane then stop_following(cx, panel) end
-	end
-	-- A closed panel takes its preview with it.
-	local own = previews[ev.pane]
-	previews[ev.pane] = nil
-	preview_latest[ev.pane] = nil
-	if own ~= nil and cx ~= nil and is_preview(cx, own) then
-		pcall(function() cx.layout:close(own) end)
-	end
 end)
 
 local function publish_shortcuts(cx: SessionContext, pane: number)
@@ -358,7 +220,7 @@ end
 -- Host-generated commands must execute only on the originating local window.
 tern.route.link(function(link: any, cx: SessionContext)
 	local route, q = string.match(link.url, "^tern%-projects://([a-z]+)%?(.*)$")
-	if route ~= "resume" and route ~= "launch" and route ~= "preview" and route ~= "shortcuts" and route ~= "keyboard" and route ~= "keyconfig" then return nil end
+	if route ~= "resume" and route ~= "launch" and route ~= "shortcuts" and route ~= "keyboard" and route ~= "keyconfig" then return nil end
 	if link.pane == nil then return { handled = true } end
 	local origin = find_pane(cx, link.pane)
 	if route == "shortcuts" or route == "keyboard" or route == "keyconfig" then
@@ -373,20 +235,6 @@ tern.route.link(function(link: any, cx: SessionContext)
 			cx:command("preferences")
 			cx:toast("info", "Customize Projects shortcuts", "Choose Keyboard and search for Projects.")
 		end
-		return { handled = true }
-	end
-	if route == "preview" then
-		-- Links are credited to the focused pane, so an update sent after focus left the panel is
-		-- dropped here; the panel resends it, as it only trusts the chat the window says it showed.
-		if origin == nil or origin.block ~= KIND or cx.session:focused() ~= link.pane then return { handled = true } end
-		local follow = string.match(q, "follow=1") ~= nil
-		-- The transcript and its index live on this machine only.
-		if cx.hosts:current().kind ~= "local" then
-			cx:toast("error", "Cannot preview a chat on a remote host", "Switch to the local host first.")
-			return { handled = true }
-		end
-		local uid = unpct(string.match(q, "uid=([^&]*)") or "")
-		if uid ~= "" then request_preview(link.pane, uid, follow) end
 		return { handled = true }
 	end
 	local key = ""

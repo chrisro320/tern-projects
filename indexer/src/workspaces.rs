@@ -1,5 +1,6 @@
 //! OVNFS is authoritative: no stored checkout list, automatic daemon startup or operation replay.
 use anyhow::{bail, ensure, Context, Result};
+use crate::text::plain_path;
 use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,10 +18,39 @@ pub struct Request {
     pub identity: Option<String>,
     pub expected: Option<String>,
     pub branch: Option<String>,
+    pub agents: Option<Vec<Agent>>,
+    pub removing: Option<bool>,
+    pub paths: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Agent {
+    pub cwd: Option<String>,
+    pub state: String,
+    pub live: bool,
+}
+
+fn command(program: &str, args: &[&str]) -> Command {
+    let mut command = Command::new(program);
+    command.args(args);
+    // OVNFS also spawns Git. Never let the launching shell select another repository,
+    // index, object store or ref namespace, including through command-scoped config.
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("GIT_CONFIG") || matches!(name.as_ref(),
+            "GIT_DIR" | "GIT_WORK_TREE" | "GIT_INDEX_FILE" | "GIT_OBJECT_DIRECTORY"
+            | "GIT_ALTERNATE_OBJECT_DIRECTORIES" | "GIT_COMMON_DIR" | "GIT_NAMESPACE"
+            | "GIT_SHALLOW_FILE" | "GIT_REPLACE_REF_BASE" | "GIT_NO_REPLACE_OBJECTS"
+            | "GIT_CEILING_DIRECTORIES" | "GIT_DISCOVERY_ACROSS_FILESYSTEM" | "GIT_PREFIX"
+            | "GIT_IMPLICIT_WORK_TREE" | "GIT_GRAFT_FILE" | "GIT_INTERNAL_SUPER_PREFIX" | "GIT_QUARANTINE_PATH") {
+            command.env_remove(key);
+        }
+    }
+    command
+}
 fn run(program: &str, args: &[&str]) -> Result<Output> {
-    Command::new(program).args(args).output().with_context(|| format!("cannot run {program}"))
+    command(program, args).output().with_context(|| format!("cannot run {program}"))
 }
 fn output(out: Output, conflicts: bool) -> Result<Value> {
     let value = serde_json::from_slice::<Value>(&out.stdout);
@@ -31,12 +61,28 @@ fn output(out: Output, conflicts: bool) -> Result<Value> {
     bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
 }
 fn ovnfs(args: &[&str], conflicts: bool) -> Result<Value> { output(run("ovnfs", args)?, conflicts) }
+fn git_output(path: &str, args: &[&str]) -> Result<Output> {
+    command("git", &["-C", path]).args(args).output().context("cannot run git")
+}
 fn git(path: &str, args: &[&str]) -> Result<String> {
-    let mut argv = vec!["-C", path];
-    argv.extend_from_slice(args);
-    let out = run("git", &argv)?;
+    let out = git_output(path, args)?;
     ensure!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr).trim());
     Ok(String::from_utf8(out.stdout)?.trim().to_owned())
+}
+fn real_path(path: &str) -> Result<String> {
+    let path = plain_path(std::fs::canonicalize(path)?);
+    let text = path.to_str().context("path is not Unicode")?;
+    Ok(if cfg!(windows) { text.replace('\\', "/") } else { text.to_owned() })
+}
+fn capture_root(source: &str) -> Result<String> {
+    let source = real_path(source)?;
+    ensure!(Path::new(&source).is_dir(), "source is not a directory");
+    let out = git_output(&source, &["rev-parse", "--show-toplevel"])?;
+    if out.status.success() {
+        real_path(String::from_utf8(out.stdout)?.trim())
+    } else {
+        Ok(source) // Non-Git folders are supported by OVNFS.
+    }
 }
 fn hash(value: &Value) -> String { format!("{:x}", Sha256::digest(value.to_string().as_bytes())) }
 fn identity(c: &Value) -> String { hash(&json!([c["name"], c["source"], c["path"], c["created"], c["base"]])) }
@@ -87,7 +133,11 @@ fn listing() -> Result<Value> {
         .remove("snapshots").context("OVNFS snapshots missing")?;
     let snapshots = snapshots.as_array().context("OVNFS snapshots must be an array")?;
     let checkouts = data["checkouts"].as_array_mut().context("OVNFS checkouts missing")?;
-    for c in checkouts.iter_mut() { c["identity"] = json!(identity(c)); }
+    for c in checkouts.iter_mut() {
+        c["identity"] = json!(identity(c));
+        c["location"] = json!(c["path"].as_str().and_then(|p| real_path(p).ok()));
+        c["source_location"] = json!(c["source"].as_str().and_then(|p| real_path(p).ok()));
+    }
     // Snapshot names are not identities: a removed parent's reused name must not adopt its children.
     let parents: Vec<_> = checkouts.iter().map(|c| {
         let snap = snapshots.iter().find(|s| !c["parent"].is_null() && s["id"] == c["parent"])?;
@@ -109,15 +159,31 @@ fn checkout(req: &Request) -> Result<Value> {
     ensure!(req.identity.as_deref() == c["identity"].as_str(), "workspace identity changed; refresh");
     Ok(c.clone())
 }
+// A missing symbolic branch is unborn; unreadable HEADs, refs and objects are errors.
+fn head(path: &str) -> Result<Option<String>> {
+    let out = git_output(path, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])?;
+    if out.status.success() { return Ok(Some(String::from_utf8(out.stdout)?.trim().to_owned())); }
+    ensure!(out.status.code() == Some(1), "Cannot read Git HEAD: {}", String::from_utf8_lossy(&out.stderr).trim());
+    ensure!(git(path, &["rev-parse", "--is-inside-work-tree"])? == "true", "Not a readable Git work tree");
+    let reference = git(path, &["symbolic-ref", "--quiet", "HEAD"])?;
+    ensure!(reference.starts_with("refs/heads/"), "HEAD does not name a branch");
+    let reference = git_output(path, &["show-ref", "--verify", "--quiet", &reference])?;
+    ensure!(reference.status.code() == Some(1), "Git HEAD exists but its commit cannot be read");
+    Ok(None)
+}
 fn commits(c: &Value) -> Result<Value> {
     if c["git"] != true { return Ok(Value::Null); }
     let source = c["source"].as_str().context("source missing")?;
     let path = c["path"].as_str().context("workspace path missing")?;
-    let tip = git(source, &["rev-parse", "--verify", "HEAD"])?;
-    let range = format!("{tip}..HEAD");
-    let count: u64 = git(path, &["rev-list", "--count", &range])?.parse()?;
-    let log = git(path, &["log", "-25", "--format=%h %s", &range])?;
-    Ok(json!({"count": count, "tip":tip, "head":git(path, &["rev-parse", "HEAD"])?, "titles":log.lines().collect::<Vec<_>>()}))
+    let tip = head(source)?;
+    let head = head(path)?;
+    let (count, titles) = if head.is_some() {
+        let range = tip.as_ref().map_or_else(|| "HEAD".to_owned(), |tip| format!("{tip}..HEAD"));
+        let count: u64 = git(path, &["rev-list", "--count", &range])?.parse()?;
+        let log = git(path, &["log", "-25", "--format=%h %s", &range])?;
+        (count, log.lines().map(str::to_owned).collect::<Vec<_>>())
+    } else { (0, Vec::new()) };
+    Ok(json!({"count":count, "tip":tip, "head":head, "titles":titles}))
 }
 fn details(c: &Value) -> Result<Value> {
     let diff = ovnfs(&["diff", c["name"].as_str().unwrap(), "--json"], false)?;
@@ -147,12 +213,53 @@ fn save_branch(c: &Value, branch: &str) -> Result<Value> {
     let source = c["source"].as_str().unwrap();
     git(source, &["check-ref-format", "--branch", branch])?;
     let reference = format!("refs/heads/{branch}");
-    let exists = run("git", &["-C", source, "show-ref", "--verify", "--quiet", &reference])?;
+    let exists = git_output(source, &["show-ref", "--verify", "--quiet", &reference])?;
     ensure!(exists.status.code() == Some(1), "Branch already exists or cannot be checked; choose a new branch");
     ovnfs(&["apply", c["name"].as_str().unwrap(), "--branch", branch, "--json"], false)
 }
 
+fn authorize(req: &Request) -> Result<Value> {
+    // Always use a successful current listing, not the panel's last (possibly failed) poll.
+    let c = checkout(req)?;
+    let root = std::fs::canonicalize(c["path"].as_str().context("workspace path missing")?)
+        .context("Cannot resolve workspace path")?;
+    for agent in req.agents.as_ref().context("Fresh Tern agent snapshot required")? {
+        // One unresolvable agent elsewhere must not disable all workspace management.
+        let Some(path) = agent.cwd.as_deref().and_then(|p| std::fs::canonicalize(p).ok()) else { continue; };
+        if path.starts_with(&root) && (agent.state == "working" || agent.state == "waiting_input"
+            || (req.removing == Some(true) && agent.live)) {
+            bail!("{}", if req.removing == Some(true) {
+                "An agent is still live here. Close its tab before removing this workspace."
+            } else { "An agent is working or waiting for you here. Finish or stop it before applying." });
+        }
+    }
+    Ok(c)
+}
+fn removal_details(req: &Request, c: &Value) -> Result<Value> {
+    let info = details(c)?;
+    ensure!(req.expected.as_deref() == info["token"].as_str(), "Workspace changed; cancel and review removal again");
+    ensure!(info["error"].is_null(), "Cannot safely check unreturned commits; fix the Git error first");
+    Ok(info)
+}
+
 pub fn dispatch(db: &Path, req: Request) -> Result<Value> {
+    if req.action == "authorize" { return authorize(&req); }
+    if req.action == "resolve" || req.action == "roots" {
+        let mut result = serde_json::Map::new();
+        for path in req.paths.as_ref().context("paths required")? {
+            if result.contains_key(path) { continue; }
+            let value = if req.action == "resolve" {
+                json!(real_path(path).ok())
+            } else {
+                match capture_root(path) {
+                    Ok(source) => json!({"source":source}),
+                    Err(error) => json!({"error":format!("{error:#}")}),
+                }
+            };
+            result.insert(path.clone(), value);
+        }
+        return Ok(Value::Object(result));
+    }
     if req.action == "poll" {
         let mut state = status()?;
         state["busy"] = json!(busy(db)?);
@@ -176,6 +283,7 @@ pub fn dispatch(db: &Path, req: Request) -> Result<Value> {
         ensure!(status()?["state"] == "running", "Start OVNFS first");
         let source = req.source.as_deref().context("source folder required")?;
         ensure!(Path::new(source).is_absolute(), "Choose an absolute source folder");
+        ensure!(capture_root(source)? == real_path(source)?, "Capture root changed; reopen New workspace to review its actual target");
         return ovnfs(&["new", source, "--name", name, "--json"], false);
     }
     let c = checkout(&req)?;
@@ -191,11 +299,18 @@ pub fn dispatch(db: &Path, req: Request) -> Result<Value> {
             ensure!(req.expected.as_deref() == current["token"].as_str(), "Preview changed; cancel and preview again");
             ovnfs(&["apply", name, "--json"], true)
         },
-        "remove" | "save-remove" => {
-            let info = details(&c)?;
-            ensure!(req.expected.as_deref() == info["token"].as_str(), "Workspace changed; cancel and review removal again");
-            ensure!(info["error"].is_null(), "Cannot safely check unreturned commits; fix the Git error first");
-            if req.action == "save-remove" { save_branch(&c, req.branch.as_deref().context("new branch required")?)?; }
+        "save-before-remove" => {
+            let info = removal_details(&req, &c)?;
+            save_branch(&c, req.branch.as_deref().context("new branch required")?)?;
+            let current = checkout(&req)?;
+            let after = details(&current)?;
+            ensure!(after["error"].is_null() && info["changes"] == after["changes"] && info["commits"] == after["commits"],
+                "Workspace changed while saving the branch; review removal again. The branch was saved.");
+            // The frontend must obtain another fresh agent authorization before requesting remove.
+            Ok(json!({"token":after["token"]}))
+        },
+        "remove" => {
+            removal_details(&req, &c)?;
             ovnfs(&["rm", name, "--json"], false)
         },
         "branch" => save_branch(&c, req.branch.as_deref().context("new branch required")?),

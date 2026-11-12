@@ -16,13 +16,27 @@ local function panes(cx: any): any
 	for _, p in cx.session:panes() do out[tostring(p.pane)] = p end
 	return out
 end
+local function acknowledge(marks: any, visible: any, tab: number?): boolean
+	local changed = false
+	for key, mark in marks do
+		local pane = visible[key]
+		local result_tab = if pane then pane.tab else mark.tab
+		if tab ~= nil and result_tab == tab and mark.state ~= "idle" then
+			mark.state = "idle"; changed = true
+		end
+	end
+	return changed
+end
 function M.snapshot(cx: any): any
 	local marks, visible, rows = results(), panes(cx), {}
+	local focused = visible[tostring(cx.session:focused())]
+	-- A result can arrive while its tab is already shown, without a new focus event.
+	if acknowledge(marks, visible, if focused then focused.tab else nil) then tern.kv.set(KEY, marks) end
 	for _, agent in cx.agents:list() do
 		local key = tostring(agent.pane)
 		local row = {pane = agent.pane, cwd = agent.cwd, state = agent.state, live = agent.state ~= "exited", title = "Agent"}
 		local p = visible[key]
-		if p then row.title = p.title or "Agent" end
+		if p then row.title = p.title or "Agent"; row.tab = p.tab end
 		if agent.state ~= "working" and agent.state ~= "waiting_input" and marks[key] then row.state = marks[key].state end
 		known[key] = row
 		rows[key] = row
@@ -31,13 +45,13 @@ function M.snapshot(cx: any): any
 	-- Without a recorded finish event its result is unknown, never inferred from old terminal text.
 	for key, pane in visible do
 		if pane.kind == "agent" and not rows[key] and not marks[key] then
-			rows[key] = {pane = pane.pane, cwd = pane.cwd, state = "idle", live = pane.exited == nil, title = pane.title or "Agent"}
+			rows[key] = {pane = pane.pane, cwd = pane.cwd, state = "idle", live = pane.exited == nil, title = pane.title or "Agent", tab = pane.tab}
 			known[key] = rows[key]
 		end
 	end
 	for key, mark in marks do
 		if not rows[key] then
-			rows[key] = {pane = mark.pane, cwd = mark.cwd, state = mark.state, live = false, title = mark.title or "Agent"}
+			rows[key] = {pane = mark.pane, cwd = mark.cwd, state = mark.state, live = false, title = mark.title or "Agent", tab = mark.tab}
 			known[key] = rows[key]
 		end
 	end
@@ -78,20 +92,20 @@ function M.start()
 			if ev.result == "closed" and marks[key] then state = marks[key].state end
 			-- An exited process is only failed when Tern reports its nonzero status.
 			for _, p in cx.session:panes() do if p.pane == ev.pane and type(p.exited) == "number" and p.exited ~= 0 then state = "failed" end end
-			marks[key] = {pane = ev.pane, cwd = row.cwd, title = row.title, state = state}
+			marks[key] = {pane = ev.pane, cwd = row.cwd, title = row.title, state = state, tab = row.tab}
+			local visible = panes(cx)
+			local focused = visible[tostring(cx.session:focused())]
+			-- Successful commands can close their pane before this event is delivered.
+			acknowledge(marks, visible, if focused then focused.tab else nil)
 			tern.kv.set(KEY, marks)
 		end
 		publish(cx)
 	end)
 	tern.on("focus", function(ev: any, cx: any)
 		if not cx then return end
-		local marks, changed = results(), false
 		-- Seeing a tab acknowledges its finished marks, not only its focused split.
-		for _, p in cx.session:panes() do
-			local key = tostring(p.pane)
-			if p.tab == ev.tab and marks[key] and marks[key].state ~= "idle" then marks[key].state = "idle"; changed = true end
-		end
-		if changed then tern.kv.set(KEY, marks) end
+		local marks = results()
+		if acknowledge(marks, panes(cx), ev.tab) then tern.kv.set(KEY, marks) end
 		publish(cx)
 	end)
 	tern.on("pane_closed", function(_ev: any, cx: any) if cx then publish(cx) end end)

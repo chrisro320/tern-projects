@@ -12,6 +12,11 @@ All notable changes to `tern-projects` will be documented in this file.
 ### Changed
 - **Portable integration fixtures**: select Cursor storage by platform, JSON-escape Windows worktree paths, compare folder and repository roots without platform-specific spelling assumptions (including concurrent first-open checks), and generate synthetic Git metadata inside the temporary home for clean CI checkouts.
 
+### Fixed
+- **Workspace mutation safety**: Enter honors Cancel and other focused dialog buttons; queued operations and save-then-remove recheck native agents against a successful current checkout listing at execution time. Resolve agent/checkout real paths and isolate Git repository-selection environment overrides in Git and OVNFS children.
+- **Workspace roots and details**: show repository-wide capture/apply roots for curated subfolders and keep their checkouts visible. Count checkout commits against an empty base for unborn sources, retain fail-closed Git errors, and re-request details cancelled by tab changes.
+- **Workspace navigation and results**: stop polling after project creation returns to Projects, use collision-free tree row keys and qualified selection IDs with scrolling, and persist acknowledgement of results finishing in an already shown agent tab.
+
 ## [0.2.12] — 2026-11-06
 
 ### Fixed

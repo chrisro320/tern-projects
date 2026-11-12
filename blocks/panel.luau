@@ -538,6 +538,7 @@ local function editor_intent(s: any, intent: string?, value: string?)
 				reload(s); return
 			end
 			if err then d.error = fmt.error(err) else
+				if s.mode == "workspaces" then workspaces.leave(s) end
 				s.editor = nil; s.view = "mine"; s.mode = "projects"
 				local p = data and data.project
 				if p then local key = "project:" .. tostring(p.id); s.sel = key; s.expanded[key] = true end

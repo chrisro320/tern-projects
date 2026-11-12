@@ -85,8 +85,9 @@ For a new harness, follow [docs/adding-a-harness.md](docs/adding-a-harness.md) r
 ## Workspace safety
 
 - OVNFS owns checkout state; Projects owns curated folders. Poll only the Workspaces view, probe `status` before `ls` (which otherwise auto-starts), inherit daemon environment, and never use `dirty` for source-change counts. Cache details by checkout identity, touched and daemon pid; cap management requests at three.
-- Re-read native agents immediately before mutations: working/waiting blocks Apply, any live agent blocks removal. Check identities and fresh preview/detail tokens in the backend. Apply conflicts are successful structured results, never automatic retries.
+- Re-read native agents inside the mutation's admitted request slot and require a fresh successful checkout listing: working/waiting blocks Apply, any live agent blocks removal. Resolve both sides to real filesystem paths; skip individual unresolvable agent cwds, not all management. Save-before-remove is a separate backend stage followed by another authorization. Check identities and fresh preview/detail tokens in the backend. Apply conflicts are successful structured results, never automatic retries.
 - Workspace mutations use a separate OS-held lock, retained by the CLI across plugin reloads, not an operation journal. Re-read state after reload and do not replay. Branch preservation refuses existing refs; removal warns about excluded files and unreturned commits. Only explicitly confirmed OVNFS checkout removal is allowed; never delete source folders.
+- Discard inherited Git repository/index/object/ref-selection environment overrides for both Git and OVNFS children. Resolve curated Git subfolders to their capture root before showing creation confirmation and group checkouts by that root. An unborn source is an empty commit base; corrupt/unreadable Git metadata remains an error. Cancelled request generations must invalidate loading detail entries.
 
 ## Deletion safety
 

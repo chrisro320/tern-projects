@@ -15,16 +15,20 @@ pump = function()
 		local job = table.remove(queue, 1)
 		if job.current() then
 			running += 1
-			cli.request({op = "workspaces", request = job.payload}, function(data: any, err: string?)
+			local function finish(data: any, err: string?)
 				running -= 1
 				if job.current() then job.cb(data, err) end
 				pump()
-			end)
+			end
+			local function start(err: string?)
+				if err then finish(nil, err) else cli.request({op = "workspaces", request = job.payload}, finish) end
+			end
+			if job.prepare then job.prepare(start) else start(nil) end
 		end
 	end
 end
-local function request(payload: any, cb: (any, string?) -> (), current: () -> boolean)
-	table.insert(queue, {payload = payload, cb = cb, current = current})
+local function request(payload: any, cb: (any, string?) -> (), current: () -> boolean, prepare: any?)
+	table.insert(queue, {payload = payload, cb = cb, current = current, prepare = prepare})
 	pump()
 end
 local function act(verb: string, key: string?): string return "ws=" .. verb .. ":" .. fmt.pct(key or "") end
@@ -37,8 +41,9 @@ local function grouped_agents(w: any): any
 	local out = {}
 	for _, agent in w.agents do
 		local best = nil
+		local location = w.locations[agent.cwd or ""]
 		for _, checkout in w.checkouts do
-			if type(agent.cwd) == "string" and under(agent.cwd, checkout.path) and (not best or #checkout.path > #best.path) then best = checkout end
+			if type(location) == "string" and type(checkout.location) == "string" and under(location, checkout.location) and (not best or #checkout.location > #best.location) then best = checkout end
 		end
 		if best then
 			out[best.name] = out[best.name] or {}
@@ -94,8 +99,9 @@ local function dialog(w: any, kind: string, title: string, body: {any}, buttons:
 	return d
 end
 local function close(w: any)
-	if w.authorization then w.busy = false end
+	local cancel = w.authorization
 	w.dialog = nil; w.nonce = nil; w.authorization = nil; w.flow += 1
+	if cancel then cancel(nil, "Workspace authorization cancelled; retry from Workspaces.") end
 end
 local function failure(s: any, err: string)
 	local w = s.workspaces
@@ -106,7 +112,7 @@ local function failure(s: any, err: string)
 	s.cx:render()
 end
 function M.init(s: any, live: (any) -> boolean, launch: (any, string) -> ())
-	s.workspaces = {state = "loading", projects = {}, checkouts = {}, cache = {}, agents = {}, order = {}, rows = {}, seq = 0, flow = 0, live = live, launch = launch, active = false, busy = false}
+	s.workspaces = {state = "loading", projects = {}, roots = {}, checkouts = {}, cache = {}, agents = {}, locations = {}, order = {}, rows = {}, seq = 0, flow = 0, live = live, launch = launch, active = false, busy = false}
 end
 local function alive(s: any): boolean return s.workspaces.live(s) end
 local function agent_request(s: any)
@@ -134,11 +140,11 @@ function M.refresh(s: any)
 		w.pid = data.pid
 		w.checkouts = if data.state == "running" then data.checkouts or {} else {}
 		local wanted = {}
-		for _, project in w.projects do for _, folder in project.folders or {} do wanted[folder] = true end end
+		for _, root in w.roots do if root.source then wanted[root.source] = true end end
 		for _, checkout in w.checkouts do
 			local key = checkout.identity .. ":" .. checkout.touched .. ":" .. tostring(w.pid)
 			local cached = w.cache[checkout.name]
-			if wanted[checkout.source] and (not cached or cached.key ~= key or old_pid ~= w.pid) then
+			if wanted[checkout.source_location] and (not cached or cached.key ~= key or old_pid ~= w.pid) then
 				w.cache[checkout.name] = {key = key, loading = true}
 				request(payload(checkout, "details"), function(info, detail_error)
 					if w.cache[checkout.name] and w.cache[checkout.name].key == key then
@@ -159,6 +165,12 @@ function M.enter(s: any)
 	cli.request({op = "snapshot", view = "mine", per = 0, recent = 0}, function(data: any, err: string?)
 		if not alive(s) or not w.active or w.seq ~= seq then return end
 		if err then w.error = err else w.projects = data.projects or {} end
+		local folders = {}
+		for _, project in w.projects do for _, folder in project.folders or {} do table.insert(folders, folder) end end
+		request({action = "roots", paths = (tern.json :: any).array(folders)}, function(roots, root_error)
+			if root_error then w.error = root_error else w.roots = roots end
+			M.refresh(s); s.cx:render()
+		end, function() return alive(s) and w.active and w.seq == seq end)
 		M.refresh(s); s.cx:render()
 	end)
 	M.refresh(s)
@@ -173,49 +185,67 @@ end
 function M.leave(s: any)
 	local w = s.workspaces
 	w.active = false; w.seq += 1; w.polling = false; close(w)
+	-- Cancelled callbacks cannot leave a permanent "loading" entry behind.
+	for name, cached in w.cache do if cached.loading then w.cache[name] = nil end end
 end
 function M.library_changed(s: any)
 	local w = s.workspaces
 	if not w.active then M.enter(s); return end
-	w.active = false
+	M.leave(s)
 	M.enter(s)
+end
+local function authorize(s: any, req: any, checkout: any, done: (string?) -> ())
+	local w = s.workspaces
+	if not alive(s) then done("Projects panel closed before workspace authorization"); return end
+	w.nonce = tostring(tern.now()) .. ":" .. tostring(s.cx.pane)
+	local nonce = w.nonce
+	w.authorization = function(agents: any, err: string?)
+		w.authorization = nil; w.nonce = nil
+		if err then done(err); return end
+		local auth = payload(checkout, "authorize")
+		auth.removing = req.action == "remove" or req.action == "save-before-remove"
+		auth.agents = (tern.json :: any).array({})
+		for _, agent in agents do table.insert(auth.agents, {cwd = agent.cwd, state = agent.state, live = agent.live}) end
+		-- This runs inside the reserved queue slot, immediately before the mutation.
+		-- The backend re-lists the confirmed checkout and resolves both agent/checkout paths.
+		cli.request({op = "workspaces", request = auth}, function(_data: any, auth_error: string?) done(auth_error) end)
+	end
+	agent_request(s)
+	tern.timer(2000, function()
+		if w.nonce == nonce and w.authorization then w.authorization(nil, "Cannot read live Tern agents. Focus this local Projects panel and retry.") end
+	end)
 end
 local function operate(s: any, req: any, checkout: any?, cb: (any) -> ())
 	local w = s.workspaces
 	if w.busy or w.external_busy then failure(s, "A workspace operation is still running. Refresh before trying again."); return end
 	w.busy = true; w.error = nil
-	local function start()
-		if checkout then
-			local reason = blocked(w, checkout, req.action == "remove" or req.action == "save-remove")
-			if reason then w.busy = false; failure(s, reason); return end
-		end
-		-- Mutations outlive their view. Keep the callback even when the dialog/tab closes.
-		request(req, function(data, err)
+	local enqueue: (any) -> ()
+	enqueue = function(stage: any)
+		-- Mutations outlive their view. Keep their callback even when the dialog/tab closes.
+		request(stage, function(data, err)
+			if not err and stage.action == "save-before-remove" then
+				local removal = payload(checkout, "remove")
+				removal.expected = data.token
+				enqueue(removal) -- A separate queue admission and fresh agent/listing authorization.
+				return
+			end
 			w.busy = false; w.cache = {}
 			if not alive(s) then return end
 			if err then failure(s, err) else w.error = nil; cb(data) end
 			M.refresh(s); s.cx:render()
-		end, function() return true end)
+		end, function() return true end, if checkout then function(done) authorize(s, stage, checkout, done) end else nil)
 	end
-	if checkout then
-		w.nonce = tostring(tern.now()) .. ":" .. tostring(s.cx.pane)
-		w.authorization = start
-		agent_request(s)
-		local nonce = w.nonce
-		tern.timer(2000, function()
-			if w.nonce == nonce and w.authorization then w.authorization = nil; w.nonce = nil; w.busy = false; if alive(s) then failure(s, "Cannot read live Tern agents. Focus this local Projects panel and retry.") end end
-		end)
-	else start() end
+	enqueue(req)
 end
 local function buttons(): {any} return {{id = "cancel", label = "Cancel"}} end
 local function form(s: any, kind: string, checkout: any?, source: string?)
 	local w = s.workspaces
 	close(w)
 	local titles = {new = "New workspace", fork = "Fork workspace", branch = "Save commits as a new branch", ["save-remove"] = "Save commits as branch, then remove"}
-	local d = dialog(w, kind, titles[kind], {c.note(if source then "Source: " .. source else "Workspace: " .. checkout.name)}, {{id = "cancel", label = "Cancel"}, {id = "submit", label = if kind == "save-remove" then "Save branch & remove" else "Create", variant = if kind == "save-remove" then "danger" else "primary"}}, {checkout = checkout, source = source, field = tf.new(""), all = false})
+	local d = dialog(w, kind, titles[kind], {c.note(if source then "Capture / apply target: " .. source else "Workspace: " .. checkout.name)}, {{id = "cancel", label = "Cancel"}, {id = "submit", label = if kind == "save-remove" then "Save branch & remove" else "Create", variant = if kind == "save-remove" then "danger" else "primary"}}, {checkout = checkout, source = source, field = tf.new(""), all = false})
 	if kind == "branch" or kind == "save-remove" then table.insert(d.body, c.note("Commits only; working-tree source changes are not applied. Choose a branch that does not exist in the source repository."))
 	else table.insert(d.body, c.note("1–64 lowercase letters, numbers, dots, underscores or hyphens; begin with a letter or number. Names are unique across OVNFS.")) end
-	d.focus = 2
+	d.focus = 0 -- The text field precedes the buttons in the tab order.
 	s.cx:frame({{"focus", "layer.workspace.form.name"}})
 end
 local function show(s: any, checkout: any, kind: string)
@@ -254,12 +284,12 @@ local function submit(s: any, id: string)
 		local text = d.field.text
 		if d.kind == "new" then req = {action = "new", source = d.source, name = text}
 		elseif d.kind == "fork" then req = payload(checkout, "fork"); req.branch = text
-		else req = payload(checkout, d.kind); req.branch = text; if d.info then req.expected = d.info.token end end
+		else req = payload(checkout, if d.kind == "save-remove" then "save-before-remove" else d.kind); req.branch = text; if d.info then req.expected = d.info.token end end
 	elseif id == "apply" or id == "remove" then req = payload(checkout, id); req.expected = d.info.token end
 	if not req then return end
 	operate(s, req, checkout, function(data)
 		if req.action == "apply" then dialog(w, "result", "Apply result: " .. checkout.name, result_body(data), {{id = "cancel", label = "Close"}})
-		else close(w); s.cx:toast("success", if req.action == "remove" or req.action == "save-remove" then "Workspace removed" elseif req.action == "branch" then "Commits saved as branch" else "Workspace created", req.name) end
+		else close(w); s.cx:toast("success", if req.action == "remove" or req.action == "save-before-remove" then "Workspace removed" elseif req.action == "branch" then "Commits saved as branch" else "Workspace created", req.name) end
 	end)
 end
 local function choose(s: any, verb: string, key: string)
@@ -267,7 +297,21 @@ local function choose(s: any, verb: string, key: string)
 	if verb == "refresh" then w.error = nil; w.cache = {}; M.refresh(s); return end
 	if verb == "cancel" then close(w); return end
 	if verb == "start" then operate(s, {action = "start"}, nil, function() close(w) end); return end
-	if verb == "new" then form(s, "new", nil, key); return end
+	if verb == "new" then
+		close(w)
+		local d = dialog(w, "loading", "Checking capture root…", {c.note("Project folder: " .. key)}, buttons())
+		local flow = w.flow
+		request({action = "roots", paths = {key}}, function(roots, err)
+			if w.dialog ~= d then return end
+			local root = roots and roots[key]
+			if err or not root or root.error then failure(s, err or (root and root.error) or "Cannot resolve source folder"); return end
+			w.roots[key] = root
+			form(s, "new", nil, root.source)
+			table.insert(w.dialog.body, 1, c.note("Project folder: " .. key))
+			s.cx:render()
+		end, function() return alive(s) and w.active and w.flow == flow end)
+		return
+	end
 	if verb == "select" then w.selected = key; return end
 	if verb == "agent" then s.cx:open("tern-projects://workspace?focus=" .. key); return end
 	local checkout = target(w, key)
@@ -296,9 +340,15 @@ function M.event(s: any, ev: any): boolean
 			w.visible = data.visible == true
 			w.agents = data.agents or {}
 			if w.nonce and data.nonce == w.nonce and w.authorization then
-				local authorized = w.authorization
-				w.authorization = nil; w.nonce = nil
-				authorized()
+				w.authorization(w.agents, nil)
+			end
+			if w.active then
+				local paths = {}
+				for _, agent in w.agents do if type(agent.cwd) == "string" then table.insert(paths, agent.cwd) end end
+				local seq = w.seq
+				request({action = "resolve", paths = (tern.json :: any).array(paths)}, function(locations, err)
+					if not err then w.locations = locations; s.cx:render() end
+				end, function() return alive(s) and w.active and w.seq == seq end)
 			end
 			if became_visible and w.active then M.refresh(s) end
 		end
@@ -306,6 +356,7 @@ function M.event(s: any, ev: any): boolean
 	end
 	if not w.active then return false end
 	if w.dialog and w.dialog.field and (ev.ev == "edit" or ev.ev == "focus") and ev.id == "layer.workspace.form.name" then
+		w.dialog.focus = 0
 		if ev.ev == "edit" then input.edit(w.dialog.field, ev); w.dialog.all = false end
 		return true
 	end
@@ -333,11 +384,15 @@ function M.key(s: any, k: any): boolean
 		if k.name == "escape" then submit(s, "cancel")
 		elseif w.busy then return true
 		elseif k.name == "enter" then
-			local b = d.buttons[if d.field then #d.buttons else d.focus]
+			local b = d.buttons[if d.field and d.focus == 0 then #d.buttons else d.focus]
 			if b and not b.disabled then if d.kind == "menu" then choose(s, b.id, d.checkout.name) else submit(s, b.id) end end
 		elseif k.name == "tab" or (not d.field and (k.name == "up" or k.name == "down" or k.name == "left" or k.name == "right")) then
-			d.focus = (d.focus - 1 + (if k.shift or k.name == "up" or k.name == "left" then -1 else 1)) % #d.buttons + 1
-		elseif d.field then local _, all = input.key(d.field, d.all, k, tern.runtime.os); d.all = all end
+			local step = if k.shift or k.name == "up" or k.name == "left" then -1 else 1
+			if d.field then
+				d.focus = (d.focus + step) % (#d.buttons + 1)
+				s.cx:frame({{"focus", if d.focus == 0 then "layer.workspace.form.name" else (tern.json :: any).null}})
+			else d.focus = (d.focus - 1 + step) % #d.buttons + 1 end
+		elseif d.field and d.focus == 0 then local _, all = input.key(d.field, d.all, k, tern.runtime.os); d.all = all end
 		return true
 	end
 	if k.name == "tab" or k.name == "/" then return false end
@@ -367,7 +422,7 @@ function M.view(s: any): {any}
 		table.insert(rows, c.header("project:" .. tostring(project.id), project.name))
 		for _, folder in project.folders or {} do
 			local prefix = tostring(project.id) .. ":" .. folder .. ":"
-			row(prefix .. "folder", fmt.path(folder), "New workspace", "new", folder, "folder-plus", 0)
+			row("synthetic:" .. prefix .. "new", fmt.path(folder), "New workspace", "new", folder, "folder-plus", 0)
 			local seen = {}
 			local function checkout_row(checkout: any, depth: number)
 				if seen[checkout.name] then return end
@@ -379,20 +434,21 @@ function M.view(s: any): {any}
 				if info and info.commits and type(info.commits) == "table" then description ..= " · " .. tostring(info.commits.count) .. " commits not brought back" end
 				if cached and (cached.error or (info and type(info.error) == "string")) then description ..= " · details unavailable" end
 				description ..= " · " .. string.sub(checkout.touched, 1, 19):gsub("T", " ")
-				row(prefix .. checkout.name, checkout.name, description, "menu", checkout.name, if depth > 1 then "branch" else "folder-open", depth)
+				row("checkout:" .. prefix .. checkout.name, checkout.name, description, "menu", checkout.name, if depth > 1 then "branch" else "folder-open", depth)
 				for _, agent in agents[checkout.name] or {} do
 					local labels = {working = "工作中 / Working", waiting_input = "等你回覆 / Waiting for you", idle = "閒置 / Idle", done = "完成 / Done", failed = "失敗 / Failed", exited = "閒置 / Idle"}
-					row(prefix .. "agent:" .. tostring(agent.pane), labels[agent.state] or labels.idle, agent.title, "agent", tostring(agent.pane), if agent.state == "working" then "play" elseif agent.state == "waiting_input" then "bell" elseif agent.state == "failed" then "warn" else "circle", depth + 1)
+					row("agent:" .. prefix .. tostring(agent.pane), labels[agent.state] or labels.idle, agent.title, "agent", tostring(agent.pane), if agent.state == "working" then "play" elseif agent.state == "waiting_input" then "bell" elseif agent.state == "failed" then "warn" else "circle", depth + 1)
 				end
-				for _, child in w.checkouts do if child.source == folder and child.parent_name == checkout.name then checkout_row(child, depth + 1) end end
+				for _, child in w.checkouts do if child.source_location == (w.roots[folder] and w.roots[folder].source) and child.parent_name == checkout.name then checkout_row(child, depth + 1) end end
 			end
-			for _, checkout in w.checkouts do if checkout.source == folder and not checkout.parent_name then checkout_row(checkout, 1) end end
-			for _, checkout in w.checkouts do if checkout.source == folder then checkout_row(checkout, 1) end end
+			local root = w.roots[folder] and w.roots[folder].source
+			for _, checkout in w.checkouts do if root and checkout.source_location == root and not checkout.parent_name then checkout_row(checkout, 1) end end
+			for _, checkout in w.checkouts do if root and checkout.source_location == root then checkout_row(checkout, 1) end end
 		end
 	end
 	if #w.projects == 0 then table.insert(rows, c.empty("ws-empty", "folder-plus", "Add a project to see its workspaces", "Uses the same curated Mine projects and folders as Projects. Non-Git folders work too.")) end
 	w.rows, w.order = keys, order
-	table.insert(nodes, ui.node("list", {key = "workspace", selected = w.selected, role = "tern-projects.rows"}, rows))
+	table.insert(nodes, ui.node("list", {key = "workspace", selected = if w.selected and keys[w.selected] then "main.workspace." .. w.selected else nil, max = 1, role = "tern-projects.rows"}, rows))
 	return nodes
 end
 function M.layer(s: any): any

@@ -21,6 +21,7 @@ python3 scripts/check-luau.py                          # Requires luau-compile 0
 python3 scripts/test-workspace-agents.py               # Requires Luau; native-state/result lifecycle, no model
 python3 scripts/test-workspaces.py                    # Requires Luau; grouping, bounded details and editor routing, no model
 python3 scripts/test-recents.py                       # Requires Luau; Recents All/This folder scope and persistence, no model
+python3 scripts/test-follow-cwd.py                    # Requires Luau; panel folder follows the tab's terminal, no window
 actionlint                                           # Requires actionlint 1.7.12
 shellcheck scripts/*.sh                              # Requires ShellCheck 0.11.0
 tern plugin types .                                  # Regenerate tern.d.luau after Tern updates

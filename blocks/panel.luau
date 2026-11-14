@@ -18,6 +18,8 @@ local NAME_FIELD = "layer.editor.form.name"
 local SEARCH_FIELD = "main.searchbox.query"
 local NULL = (tern.json :: any).null
 local LAUNCH_CLAIM_LIFETIME = 10 -- seconds; window.luau rejects claims outside the same bound
+-- Most changes land within a few frames; a banner shown only that long makes the whole list jump.
+local BUSY_BANNER_DELAY = 500 -- milliseconds
 local launch_nonce = 0
 local cancel_flow: (any) -> ()
 
@@ -260,7 +262,12 @@ local function mutate(s: any, payload: any, done: ((any) -> ())?, on_err: ((stri
 	if s.busy then return end
 	local conf, p = s.confirm, s.picker
 	local verb = if payload.op == "delete" then "Deleting…" elseif payload.op == "project-remove" then "Removing…" elseif payload.op == "source-ignore" then "Ignoring…" elseif payload.op == "source-unignore" then "Unignoring…" elseif payload.assignment then "Moving…" elseif payload.archived == false then "Restoring…" else "Saving…"
-	s.busy = true; s.busy_label = verb
+	s.busy = true; s.busy_label = verb; s.busy_shown = false
+	local busy = {}
+	s.busy_token = busy
+	tern.timer(BUSY_BANNER_DELAY, function()
+		if live(s) and s.busy and s.busy_token == busy then s.busy_shown = true; s.cx:render() end
+	end)
 	if conf then conf.error = nil end
 	if p then p.message = nil; p.busy_label = verb end
 	request(s, payload, function(data)
@@ -1228,7 +1235,7 @@ local function confirm_auto_install(s: any)
 end
 local function hide_busy(s: any)
 	cancel_flow(s)
-	s.editor = nil; s.archived_picker = nil
+	s.editor = nil; s.archived_picker = nil; s.busy_shown = true
 	toast(s, "info", s.busy_label or "Change in progress", "Hidden, not cancelled. You'll be notified when it finishes.")
 end
 local function picker_action(s: any, act: string?)
@@ -2135,7 +2142,7 @@ local panel: BlockDef<any> = {
 			table.insert(buttons, c.icon_button("x", "dismiss-error", "Dismiss", {variant = "ghost", size = "xs"}))
 			table.insert(children, c.banner("error", "error", "warn", fmt.error(s.error), buttons))
 		end
-		if s.busy and not s.editor and not s.picker and not s.confirm then table.insert(children, c.banner("busy", "info", nil, (s.busy_label or "Working…") .. " The change is continuing.", nil, true)) end
+		if s.busy and s.busy_shown and not s.editor and not s.picker and not s.confirm then table.insert(children, c.banner("busy", "info", nil, (s.busy_label or "Working…") .. " The change is continuing.", nil, true)) end
 		if s.mode == "settings" then
 			table.insert(children, settings_view(s))
 		elseif s.mode == "workspaces" then

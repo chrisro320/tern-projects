@@ -22,6 +22,7 @@ All notable changes to `tern-projects` will be documented in this file.
 - **Panel readability**: use English-only workspace labels and reserve space beside scrollbars so settings cards, list rows and dialog content do not sit underneath the thumb.
 - **Workspace review safety**: count commits on surviving refs when checkout HEAD is unborn, retain agent guards for deleted checkout descendants, and take a final native agent snapshot after slow authorization (again after saving a branch). Routine library refreshes preserve dialogs and drafts. Missing project folders keep exact checkout associations with visible errors and retry resolution; loading/failed membership never offers unassigned actions. **Add as project** is selectable with arrows and Enter.
 - **Unborn HEAD recovery**: show the retained refs and plain-English steps to switch/create a branch before saving. Save-then-remove refuses an unborn HEAD; explicit warned removal remains available. No custom non-HEAD ref preservation is attempted.
+- **No flash after quick changes**: archiving, restoring, pinning or unpinning a chat, and other one-click changes, no longer flash a "Saving…" banner that pushed the whole list down and back; the banner now appears only when a change is still running after half a second, or at once when you hide its dialog.
 
 ## [0.2.14] — 2026-11-13
 

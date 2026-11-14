@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the Projects Recents This folder/All scope without a model or network."""
+"""Exercise the Projects Recents This folder/All scope and chat changes without a model or network."""
 import argparse
 from pathlib import Path
 import shutil
@@ -25,6 +25,7 @@ local function node(kind, props, children)
     return {kind = kind, props = props or {}, children = children or {}}
 end
 local kv = {}
+local timers = {}
 tern = {
     ui = {node = node, el = node, col = function(children) return node("col", nil, children) end, span = function(text) return node("span", {text = text}) end},
     json = {array = function(value) return value end, null = false, decode = function(value) return value end},
@@ -34,7 +35,7 @@ tern = {
     runtime = {os = "linux"},
     getenv = function() return nil end,
     now = function() return 1 end,
-    timer = function(_, _) return {cancel = function() end} end,
+    timer = function(ms, fn) table.insert(timers, {ms = ms, fn = fn}); return {cancel = function() end} end,
     kv = {get = function(key) return kv[key] end, set = function(key, value) kv[key] = value end},
 }
 local global_recent = {{uid = "all-1", title = "All one"}, {uid = "all-2", title = "All two"}}
@@ -230,7 +231,33 @@ check(retargeted.offset == 0 and runs[#runs][5] == "/tmp/recents/search", "Workt
 table.clear(opened)
 action(retargeted, "refresh"); flush()
 check(table.find(opened, "tern-projects://follow?") ~= nil, "Refresh asks the window for the followed folder")
-print("Recents scope: " .. tostring(assertions) .. " assertions passed (no model or network)")
+-- A chat change that lands quickly never flashes the busy banner above the list.
+local function busy_banner(s)
+    for _, child in panel.view(s, cx).main.children do
+        if child.props.key == "busy" then return true end
+    end
+    return false
+end
+local function fire(list) for _, t in list do t.fn() end end
+scoped_recent = {{uid = "keep-1", title = "Keep one"}}
+local changes = start({recents = "folder"})
+flush()
+table.clear(timers)
+action(changes, "archive", "recent:keep-1")
+check(changes.busy and not busy_banner(changes), "a change in flight does not push the list down at once")
+fire(timers)
+check(busy_banner(changes), "a change still running after the delay shows the busy banner")
+flush()
+check(not changes.busy and not busy_banner(changes), "the banner leaves once the change lands")
+table.clear(timers)
+action(changes, "pin", "recent:keep-1")
+flush()
+local earlier = table.clone(timers)
+action(changes, "unpin", "recent:keep-1")
+fire(earlier)
+check(changes.busy and not busy_banner(changes), "an earlier change's delay never shows the banner for the next change early")
+flush()
+print("Recents scope and chat changes: " .. tostring(assertions) .. " assertions passed (no model or network)")
 '''
     names = ("textfield", "fmt", "input", "ui", "project-editor", "picker", "resume", "chat-launch", "workspaces", "panel")
     modules = []

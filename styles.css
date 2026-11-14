@@ -39,7 +39,7 @@
 	.tp-grow { flex: 1 1 auto; min-width: 0; }
 	.tp-ws-menu { display: flex; flex-direction: column; gap: 8px; padding: 12px; }
 	.tp-ws-menu .tp-btn { justify-content: flex-start; }
-	.tp-ws-form { max-height: 58vh; overflow-y: auto; }
+	.tp-ws-form { max-height: 58vh; overflow-y: auto; padding-right: 14px; }
 	.tp-ws-source { display: flex; flex-direction: column; gap: 6px; padding: 14px 8px 3px; }
 	[data-role="tern-projects.rows"] .sf-item[data-role="tern-projects.workspace-row"] {
 		display: grid;

@@ -7,6 +7,14 @@ local input = require("./input")
 local c = require("./ui")
 local ui = tern.ui
 local M = {}
+local AVAILABILITY_KEY = "workspace-availability:v1"
+local function search_environment(): string
+	local values = {}
+	for _, key in {"PATH", "PATHEXT", "HOME", "USERPROFILE", "LOCALAPPDATA"} do
+		table.insert(values, tern.getenv(key) or "")
+	end
+	return table.concat(values, "\n")
+end
 local running = 0
 local queue: {any} = {}
 local pump: () -> ()
@@ -124,10 +132,42 @@ local function failure(s: any, err: string)
 	s.cx:toast("error", "Workspace operation blocked", w.error)
 	s.cx:render()
 end
-function M.init(s: any, live: (any) -> boolean, launch: (any, string) -> (), add_project: (any, string) -> ())
-	s.workspaces = {state = "loading", membership = "loading", library_seq = 0, projects = {}, roots = {}, checkouts = {}, cache = {}, agents = {}, locations = {}, order = {}, rows = {}, seq = 0, flow = 0, live = live, launch = launch, add_project = add_project, active = false, busy = false}
+function M.init(s: any, live: (any) -> boolean, launch: (any, string, boolean?) -> (), add_project: (any, string) -> (), on_missing: (any) -> ())
+	local ok, cached = pcall(tern.kv.get, AVAILABILITY_KEY)
+	local available = false
+	if ok and type(cached) == "table" and cached.available == true and cached.environment == search_environment() and type(cached.path) == "string" then
+		local exists, present = pcall(tern.fs.exists, cached.path)
+		available = exists and present == true
+	end
+	s.workspaces = {available = available, on_missing = on_missing, detection = 0, state = "loading", membership = "loading", library_seq = 0, projects = {}, roots = {}, checkouts = {}, cache = {}, agents = {}, locations = {}, order = {}, rows = {}, seq = 0, flow = 0, live = live, launch = launch, add_project = add_project, active = false, busy = false}
+	s.workspaces.cached_available = ok and type(cached) == "table" and cached.available == true
 end
 local function alive(s: any): boolean return s.workspaces.live(s) end
+local function availability(s: any, available: boolean, path: string?)
+	local w = s.workspaces
+	local was_available = w.available or w.cached_available
+	w.cached_available = nil
+	w.available = available
+	-- This is a host capability cache, not pane view state or an OVNFS checkout list.
+	pcall(tern.kv.set, AVAILABILITY_KEY, {available = available, path = path, environment = search_environment()})
+	if not available then
+		if w.active then M.leave(s) end
+		if was_available then s.cx:open("tern-projects://workspace?disable=1") end
+		if s.mode == "workspaces" then w.on_missing(s) end
+	end
+end
+function M.detect(s: any, done: ((boolean) -> ())?)
+	local w = s.workspaces
+	w.detection += 1
+	local detection = w.detection
+	local current = function() return alive(s) and w.detection == detection end
+	cli.request({op = "workspaces", request = {action = "detect"}}, function(data, err)
+		if not current() or err or not data then return end
+		availability(s, data.available == true, data.path)
+		if done then done(w.available) end
+		s.cx:render()
+	end, current)
+end
 local function agent_request(s: any)
 	if alive(s) then s.cx:open("tern-projects://workspace?nonce=" .. fmt.pct(s.workspaces.nonce or "")) end
 end
@@ -159,6 +199,7 @@ local function load_library(s: any)
 	cli.request({op = "snapshot", view = "mine", per = 0, recent = 0}, function(data: any, err: string?)
 		if not alive(s) or not w.active or w.seq ~= seq or w.library_seq ~= library_seq then return end
 		if err then w.membership = "error"; w.membership_error = err; s.cx:render(); return end
+		s.settings = data.settings or s.settings
 		w.projects = data.projects or {}
 		local folders = {}
 		for _, project in w.projects do for _, folder in project.folders or {} do table.insert(folders, folder) end end
@@ -168,9 +209,9 @@ local function load_library(s: any)
 end
 function M.refresh(s: any)
 	local w = s.workspaces
-	if not alive(s) or not w.active or w.polling then return end
-	agent_request(s)
+	if not alive(s) or not w.available or not w.active or w.polling then return end
 	if not w.visible then return end
+	agent_request(s)
 	if w.membership == "ready" and not w.root_polling then
 		local retry = {}
 		for _, project in w.projects do for _, folder in project.folders or {} do
@@ -185,6 +226,7 @@ function M.refresh(s: any)
 		w.polling = false
 		if err then w.state = "error"; w.status_error = err; s.cx:render(); return end
 		w.state, w.status_error, w.external_busy = data.state, data.error, data.busy
+		if data.state == "missing" then availability(s, false, nil); s.cx:render(); return end
 		local old_pid = w.pid
 		w.pid = data.pid
 		w.checkouts = if data.state == "running" then data.checkouts or {} else {}
@@ -206,10 +248,19 @@ function M.refresh(s: any)
 end
 function M.enter(s: any)
 	local w = s.workspaces
-	if w.active then return end
+	if not w.available or w.active then return end
 	w.active = true; w.seq += 1; w.polling = false
+	w.visible = nil; w.agents_unknown = nil
 	local seq = w.seq
 	load_library(s)
+	agent_request(s) -- One visibility handshake, not a periodic request while hidden.
+	tern.timer(3000, function()
+		if not alive(s) or not w.active or w.seq ~= seq or w.visible ~= nil then return end
+		-- Non-local hosts cannot supply window agents. Listing is still useful;
+		-- mutations continue to require a fresh, successful native authorization.
+		w.visible = true; w.agents_unknown = true; w.agents = {}; w.locations = {}
+		M.refresh(s)
+	end)
 	M.refresh(s)
 	local function tick()
 		tern.timer(2000, function()
@@ -356,12 +407,18 @@ local function submit(s: any, id: string)
 	if not req then return end
 	operate(s, req, checkout, function(data)
 		if req.action == "apply" then dialog(w, "result", "Apply result: " .. checkout.name, result_body(data), {{id = "cancel", label = "Close"}})
-		else close(w); s.cx:toast("success", if req.action == "remove" or req.action == "save-before-remove" then "Workspace removed" elseif req.action == "branch" then "Commits saved as branch" else "Workspace created", req.name) end
+		else close(w); s.cx:toast("success", if req.action == "remove" or req.action == "save-before-remove" then "Workspace removed" elseif req.action == "branch" then "Commits saved as branch" else "Workspace created", if req.action == "fork" then req.branch else req.name) end
 	end)
 end
 local function choose(s: any, verb: string, key: string)
 	local w = s.workspaces
-	if verb == "refresh" then w.error = nil; w.cache = {}; load_library(s); M.refresh(s); return end
+	if verb == "refresh" then
+		M.detect(s, function(available)
+			if not available or not w.active then return end
+			w.error = nil; w.cache = {}; load_library(s); M.refresh(s)
+		end)
+		return
+	end
 	if verb == "cancel" then close(w); return end
 	if verb == "start" then operate(s, {action = "start"}, nil, function() close(w) end); return end
 	if verb == "add-project" then w.add_project(s, key); return end
@@ -386,7 +443,7 @@ local function choose(s: any, verb: string, key: string)
 	if not checkout then return end
 	if verb == "menu" then
 		local choices = {}
-		for _, item in {{"open", "Open new OMP", "play"}, {"changes", "Show source changes / commits", "search"}, {"fork", "Fork workspace", "branch"}, {"preview", "Preview apply to source", "arrow-up"}, {"branch", "Save commits as branch", "branch"}, {"remove", "Remove workspace", "trash"}} do
+		for _, item in {{"open", "New chat", "play"}, {"changes", "Show source changes / commits", "search"}, {"fork", "Fork workspace", "branch"}, {"preview", "Preview apply to source", "arrow-up"}, {"branch", "Save commits as branch", "branch"}, {"remove", "Remove workspace", "trash"}} do
 			if item[1] ~= "branch" or checkout.git then table.insert(choices, {id = item[1], label = item[2], icon = item[3]}) end
 		end
 		close(w); dialog(w, "menu", checkout.name, {}, choices, {checkout = checkout}); return
@@ -401,22 +458,24 @@ local function choose(s: any, verb: string, key: string)
 end
 function M.event(s: any, ev: any): boolean
 	local w = s.workspaces
+	if not w.available then return false end
 	if ev.ev == "action" and ev.act == "workspace-agents" then
 		local ok, data = pcall(tern.json.decode, ev.value or "")
 		if ok and type(data) == "table" then
 			local became_visible = data.visible == true and not w.visible
 			w.visible = data.visible == true
 			w.agents = data.agents or {}
+			w.agents_unknown = nil
 			if w.nonce and data.nonce == w.nonce and w.authorization then
 				w.authorization(w.agents, nil)
 			end
-			if w.active then
+			if w.active and w.visible then
 				local paths = {}
 				for _, agent in w.agents do if type(agent.cwd) == "string" then table.insert(paths, agent.cwd) end end
 				local seq = w.seq
 				request({action = "resolve", paths = (tern.json :: any).array(paths)}, function(locations, err)
 					if not err then w.locations = locations; s.cx:render() end
-				end, function() return alive(s) and w.active and w.seq == seq end)
+				end, function() return alive(s) and w.active and w.visible and w.seq == seq end)
 			end
 			if became_visible and w.active then M.refresh(s) end
 		end
@@ -468,6 +527,11 @@ function M.key(s: any, k: any): boolean
 	local idx = table.find(w.order, w.selected) or 0
 	if #w.order > 0 and (k.name == "down" or k.name == "up") then w.selected = w.order[math.clamp(idx + (if k.name == "down" then 1 else -1), 1, #w.order)]; return true end
 	local row = w.rows[w.selected or ""]
+	if k.name == "n" and (k.meta or (k.ctrl and tern.runtime.os ~= "macos")) then
+		local checkout = if row and row.kind == "menu" then target(w, row.key) else nil
+		if checkout then w.launch(s, checkout.path, k.shift == true) end
+		return checkout ~= nil
+	end
 	if row and k.name == "enter" then choose(s, row.kind, row.key); return true end
 	if row and k.name == "f10" and k.shift and row.kind == "menu" then choose(s, "menu", row.key); return true end
 	return false
@@ -480,9 +544,10 @@ function M.view(s: any): {any}
 	end
 	local nodes: {any} = {ui.el("div", {key = "wsbar", class = "tp-bar"}, {c.note("OVNFS · " .. w.state), c.grow(), c.button("Add project", "create", {size = "sm", icon = "plus"}), c.icon_button("redo", act("refresh"), "Refresh workspaces", {size = "sm"})})}
 	if w.state ~= "running" then
-		local text = if w.state == "loading" then "Checking OVNFS…" elseif w.state == "missing" then "OVNFS is not installed" elseif w.state == "stopped" then "OVNFS is not running" else "OVNFS error"
-		table.insert(nodes, c.banner("ws-status", if w.state == "error" or w.state == "missing" then "error" else "info", nil, text .. (if w.status_error then ": " .. fmt.error(w.status_error) else ""), if w.state == "stopped" then {c.button("Start", act("start"), {size = "sm", variant = "primary"})} else nil))
+		local text = if w.state == "loading" then "Checking OVNFS…" elseif w.state == "stopped" then "OVNFS is not running" else "OVNFS error"
+		table.insert(nodes, c.banner("ws-status", if w.state == "error" then "error" else "info", nil, text .. (if w.state ~= "stopped" and w.status_error then ": " .. fmt.error(w.status_error) else ""), if w.state == "stopped" then {c.button("Start", act("start"), {size = "sm", variant = "primary"})} else nil))
 	end
+	if w.agents_unknown then table.insert(nodes, c.banner("ws-agents", "info", nil, "Agent status is unavailable. Applying or removing still requires a live Tern agent check.")) end
 	if w.external_busy or w.busy then table.insert(nodes, c.banner("ws-pending", "info", nil, "A workspace operation is in progress. It continues across plugin reloads; no operation will be replayed.", nil, true)) end
 	if w.error then table.insert(nodes, c.banner("ws-error", "error", "warn", w.error)) end
 	if w.membership == "loading" then table.insert(nodes, c.banner("ws-membership", "info", nil, "Loading Mine projects and workspace membership…"))

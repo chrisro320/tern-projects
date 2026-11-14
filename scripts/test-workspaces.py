@@ -24,18 +24,21 @@ end
 local function node(kind, props, children)
     return {kind = kind, props = props or {}, children = children or {}}
 end
-local timers = {}
+local timers, store, launched, links, toasts = {}, {}, {}, {}, {}
+local renders = 0
+local installed, executable_present, poll_state = false, false, "running"
+local settings, launch_error = {}, nil
 tern = {
-    ui = {node = node, el = node, col = function(children) return node("col", nil, children) end},
+    ui = {node = node, el = node, col = function(children) return node("col", nil, children) end, span = function(text, class) return node("span", {text = text, class = class}) end},
     json = {array = function(value) return value end, null = false, decode = function(value) return value end},
-    fs = {exists = function() return true end, write = function() end},
+    fs = {exists = function() return executable_present end, write = function() end},
     pane = {list = function() return {{pane = 1}} end},
     plugin = {data = "/tmp/ws-test/plugin"},
     runtime = {os = "linux"},
     getenv = function() return nil end,
     now = function() return 1 end,
     timer = function(delay, cb) table.insert(timers, {delay = delay, cb = cb}); return {cancel = function() end} end,
-    kv = {get = function() return nil end, set = function() end},
+    kv = {get = function(key) return store[key] end, set = function(key, value) store[key] = value end},
 }
 local projects, checkouts, pending, calls, pid = {}, {}, {}, {}, 10
 local roots = {["/tmp/ws-test/repo/app"] = "/tmp/ws-test/repo"}
@@ -44,14 +47,14 @@ local agent_panel, agent_snapshots = nil, {}
 local active_workspace, peak_workspace = 0, 0
 local modules = {
     picker = {},
-    updates = {get = function() return {} end, subscribe = function() return function() end end},
+    updates = {get = function() return {status = "idle", current_version = "0.2.14", command = ""} end, subscribe = function() return function() end end},
 }
 modules.cli = {
     status = function() return nil end,
     run = function(_, _, cb) cb({}) end,
     request = function(payload, cb, current)
         table.insert(calls, payload)
-        if payload.op == "workspaces" then
+        if payload.op == "workspaces" and payload.request.action ~= "detect" then
             active_workspace += 1
             peak_workspace = math.max(peak_workspace, active_workspace)
         end
@@ -63,6 +66,10 @@ local function require(path)
     return assert(modules[name], "unknown fixture dependency: " .. path)
 end
 __MODULES__
+modules["chat-launch"].open = function(pane, cwd, command, resuming, live, _fallback)
+    check(live(), "workspace launch retains the panel liveness boundary")
+    table.insert(launched, {pane = pane, cwd = cwd, command = command, resuming = resuming})
+end
 local panel, workspaces, fmt, tf = modules.panel, modules.workspaces, modules.fmt, modules.textfield
 local function settle(index)
     local job = table.remove(pending, index or 1)
@@ -71,9 +78,12 @@ local function settle(index)
         return
     end
     local p, data, err = job.payload, {}, nil
-    if p.op == "workspaces" then active_workspace -= 1 end
+    if p.op == "workspaces" and p.request.action ~= "detect" then active_workspace -= 1 end
     if job.current and not job.current() then return end
-    if p.op == "snapshot" then data = {projects = projects, settings = {}, pinned = {}, recent = {}}; err = snapshot_error
+    if p.op == "snapshot" then data = {projects = projects, settings = settings, pinned = {}, recent = {}}; err = snapshot_error
+    elseif p.op == "archived" then data = {sessions = {}, total = 0}
+    elseif p.op == "harnesses" then data = {harnesses = {{id = "codex", label = "Codex", installed = true, multi_root = true, path = "/bin/codex"}, {id = "omp", label = "OMP", installed = false, reason = "OMP CLI was not found"}}}
+    elseif p.op == "launch-plan" then data = {cwd = p.cwd, command = p.harness .. " --fixture", warnings = {}}; err = launch_error
     elseif p.op == "folders" then data = {path = p.path}
     elseif p.op == "project-save" then
         local project = {id = tostring(#projects + 1), name = p.name, folders = table.clone(p.folders)}
@@ -81,7 +91,8 @@ local function settle(index)
         data = {project = project}
     elseif p.op == "workspaces" then
         local r = p.request
-        if r.action == "poll" then data = {state = "running", checkouts = checkouts, pid = pid}
+        if r.action == "detect" then data = {available = installed, path = if installed then "/bin/ovnfs" else nil}
+        elseif r.action == "poll" then data = {state = poll_state, checkouts = checkouts, pid = pid, error = if poll_state == "stopped" then "OVNFS is not running." elseif poll_state == "error" then "fixture permission denied" else nil}
         elseif r.action == "roots" then
             err = roots_error
             for _, path in r.paths do data[path] = if root_failures[path] then {error = root_failures[path]} else {source = roots[path] or path} end
@@ -94,7 +105,7 @@ local function settle(index)
         elseif r.action == "save-before-remove" then data = {token = "saved-token"}
         elseif r.action == "resolve" then
             for _, path in r.paths do data[path] = if string.find(path, "missing", 1, true) then false else path end
-        elseif r.action ~= "apply" and r.action ~= "remove" then error("unexpected operation: " .. r.action) end
+        elseif r.action ~= "apply" and r.action ~= "remove" and r.action ~= "fork" then error("unexpected operation: " .. r.action) end
     end
     job.cb(data, err)
 end
@@ -106,7 +117,8 @@ local function flush()
         settle()
     end
 end
-local cx = {pane = 1, render = function() end, frame = function() end, toast = function() end, open = function(_, url)
+local cx = {pane = 1, render = function() renders += 1 end, frame = function() end, toast = function(_, level, title, detail) table.insert(toasts, {level = level, title = title, detail = detail}) end, open = function(_, url)
+    table.insert(links, url)
     local nonce = string.match(url, "nonce=(.+)$")
     if nonce then table.insert(pending, {native = true, nonce = fmt.unpct(nonce)}) end
 end}
@@ -114,6 +126,11 @@ local function start(mode)
     local s = panel.init(cx, {mode, "/tmp/ws-test/header"})
     s.workspaces.visible = true
     workspaces.refresh(s)
+    flush()
+    if mode == "workspaces" and s.mode ~= mode and s.workspaces.available then
+        panel.event(s, {ev = "action", act = "mode", value = mode}, cx)
+    end
+    if s.mode == "workspaces" then s.workspaces.visible = true; workspaces.refresh(s) end
     flush()
     return s
 end
@@ -138,6 +155,70 @@ local function has_text(nodes, text)
     end
     return false
 end
+local function panel_nodes(s) return all_nodes({panel.view(s, cx).main}) end
+local function has_tab(s)
+    for _, n in panel_nodes(s) do
+        if n.props.actions and n.props.actions.click == "mode=workspaces" then return true end
+    end
+    return false
+end
+local function count_workspace(verb)
+    local count = 0
+    for _, p in calls do if p.op == "workspaces" and (not verb or p.request.action == verb) then count += 1 end end
+    return count
+end
+local missing = panel.init(cx, {"projects", "/tmp/ws-test/header"}, {mode = "workspaces"})
+check(missing.mode == "projects" and not has_tab(missing), "missing and unknown installations never flash a restored Workspaces tab")
+flush()
+check(not has_tab(missing) and count_workspace() == 1 and count_workspace("detect") == 1, "missing performs only detection, never status or listing")
+panel.key(missing, {name = "tab"}, cx); flush()
+check(missing.mode == "projects" and missing.view == "discovered", "Tab reaches Discovered")
+panel.key(missing, {name = "tab"}, cx); flush()
+check(missing.mode == "search", "Tab skips missing Workspaces")
+panel.key(missing, {name = "tab", shift = true}, cx); flush()
+check(missing.mode == "projects" and missing.view == "discovered", "Shift+Tab also skips missing Workspaces")
+action(missing, "mode", "workspaces"); flush()
+check(missing.mode == "projects" and not missing.workspaces.active, "commands targeting a missing Workspaces view fall back to Projects")
+action(missing, "open=workspaces:"); flush()
+check(missing.mode == "projects", "window open requests also fall back")
+action(missing, "mode", "settings"); flush()
+check(has_text(panel_nodes(missing), "Cycle Mine / Discovered / Search / Settings"), "keyboard help omits missing Workspaces")
+for _, timer in table.clone(timers) do if timer.delay == 120000 then timer.cb(cx) end end
+flush()
+check(count_workspace() == 1, "chat-index timer does not re-detect or poll missing OVNFS")
+action(missing, "refresh"); flush()
+check(count_workspace() == 2 and count_workspace("detect") == 2 and not has_tab(missing), "explicit Refresh performs one detection without flashing")
+installed = true; executable_present = true
+action(missing, "refresh"); flush()
+check(has_tab(missing) and not missing.workspaces.active, "install then Refresh exposes the tab without reopening or polling it")
+local reopened = panel.init(cx, {"projects", "/tmp/ws-test/header"}, {mode = "workspaces"})
+check(has_tab(reopened) and reopened.mode == "workspaces", "positive detection restores Workspaces before later opens render")
+flush(); reopened.alive = false
+action(missing, "mode", "workspaces"); missing.workspaces.visible = true; workspaces.refresh(missing); flush()
+check(missing.mode == "workspaces" and missing.workspaces.active, "installed Workspaces becomes active on selection")
+poll_state = "stopped"; workspaces.refresh(missing); flush()
+check(has_text(view(missing), "OVNFS is not running") and has_text(view(missing), "Start"), "stopped state retains its Start button")
+poll_state = "error"; workspaces.refresh(missing); flush()
+check(has_text(view(missing), "OVNFS error: Fixture permission denied"), "error state retains its reason")
+installed = false; executable_present = false
+workspace_action(missing, "refresh"); flush()
+check(missing.mode == "projects" and not missing.workspaces.active and not has_tab(missing), "Refresh after removal leaves Workspaces and hides its tab")
+local removed = panel.init(cx, {"projects", "/tmp/ws-test/header"}, {mode = "workspaces"})
+check(removed.mode == "projects" and not has_tab(removed), "negative cache never flashes on reopen")
+flush(); removed.alive = false; missing.alive = false
+installed = true; executable_present = true; poll_state = "running"
+-- An old positive result is also checked synchronously before rendering after uninstall.
+local first_installed = panel.init(cx, {"projects", "/tmp/ws-test/header"})
+check(not has_tab(first_installed), "the first installation is hidden until detection completes")
+flush()
+check(has_tab(first_installed), "the first detection can reveal Workspaces")
+first_installed.alive = false
+executable_present = false; installed = false
+local stale = panel.init(cx, {"workspaces", "/tmp/ws-test/header"})
+check(stale.mode == "projects" and not has_tab(stale), "a deleted cached executable cannot flash on a later open")
+flush(); stale.alive = false
+installed = true; executable_present = true
+calls = {}
 local function checkout(name, source, parent)
     return {name = name, source = source, source_location = source, location = "/mount/" .. name, path = "/mount/" .. name, identity = name, touched = "2026-11-12T00:00:00Z", parent_name = parent}
 end
@@ -148,6 +229,41 @@ local function detail_calls()
 end
 local s = start("workspaces")
 check(has_text(view(s), "Add a project to see its workspaces"), "no projects and no checkouts keeps the empty state")
+-- Known-hidden views do no periodic bridge work, resolving or rendering.
+s.workspaces.visible = false
+local hidden_links, hidden_resolves, hidden_polls, hidden_renders = #links, count_workspace("resolve"), count_workspace("poll"), renders
+for _, timer in table.clone(timers) do if timer.delay == 2000 then timer.cb(cx) end end
+flush()
+check(#links == hidden_links and count_workspace("resolve") == hidden_resolves and count_workspace("poll") == hidden_polls, "hidden timer requests neither agent snapshots nor path resolution nor OVNFS polls")
+action(s, "workspace-agents", {visible = false, agents = {{cwd = "/hidden/new-agent", state = "idle", live = true}}}); flush()
+check(count_workspace("resolve") == hidden_resolves and renders == hidden_renders, "hidden agent payload updates state without resolving paths or rendering")
+check(s.workspaces.agents[1].cwd == "/hidden/new-agent", "hidden agent state is retained")
+for _, mode in {"projects", "search", "settings"} do
+    action(s, "mode", mode); flush()
+    local before_render, before_resolve = renders, count_workspace("resolve")
+    action(s, "workspace-agents", {visible = true, agents = {}}); flush()
+    check(renders == before_render and count_workspace("resolve") == before_resolve, "agent payloads do not redraw or resolve outside Workspaces: " .. mode)
+end
+action(s, "mode", "workspaces"); s.workspaces.visible = true; workspaces.refresh(s); flush()
+-- A non-local window can refuse the route entirely. Listing has a bounded wait.
+local timeout_start, timeout_polls = #timers, count_workspace("poll")
+local without_agents = panel.init(cx, {"workspaces", "/tmp/ws-test/header"})
+flush()
+check(without_agents.workspaces.visible == nil and without_agents.workspaces.state == "loading", "initial listing waits briefly for a native visibility snapshot")
+for index = timeout_start + 1, #timers do if timers[index].delay == 3000 then timers[index].cb(cx) end end
+flush()
+check(count_workspace("poll") == timeout_polls + 1 and without_agents.workspaces.state == "running", "a refused window snapshot cannot leave the first OVNFS poll stuck")
+check(without_agents.workspaces.agents_unknown and #without_agents.workspaces.agents == 0, "timeout uses unknown agent status instead of stale results")
+check(has_text(view(without_agents), "Agent status is unavailable. Applying or removing still requires a live Tern agent check."), "unknown agent status is explicit while browsing remains available")
+without_agents.alive = false
+local known_hidden_start, known_hidden_polls = #timers, count_workspace("poll")
+local known_hidden = panel.init(cx, {"workspaces", "/tmp/ws-test/header"})
+known_hidden.workspaces.visible = false
+flush()
+for index = known_hidden_start + 1, #timers do if timers[index].delay == 3000 then timers[index].cb(cx) end end
+flush()
+check(count_workspace("poll") == known_hidden_polls and not known_hidden.workspaces.visible, "visibility timeout never overrides a known-hidden window")
+known_hidden.alive = false
 checkouts = {
     checkout("parent", "/tmp/ws-test/repo"),
     checkout("child", "/tmp/ws-test/repo", "parent"),
@@ -353,6 +469,49 @@ action(s, "create"); flush(); action(s, "editor", "cancel")
 check(s.mode == "workspaces" and not s.editor, "header cancel returns to Workspaces")
 workspace_action(s, "add-project", "/tmp/ws-test/other"); action(s, "editor", "cancel")
 check(s.mode == "workspaces" and not s.editor, "Add as project cancel returns to Workspaces")
+workspace_action(s, "fork", "other")
+tf.set(s.workspaces.dialog.field, "new-child")
+workspace_action(s, "dialog", "submit"); flush()
+check(toasts[#toasts].title == "Workspace created" and toasts[#toasts].detail == "new-child", "Fork success names the new child, never the parent")
+-- The workspace menu and keyboard both use Projects' launch flow, never a fixed harness.
+settings.default_harness = "codex"
+local before_harnesses = #calls
+workspace_action(s, "menu", "other")
+check(has_text(all_nodes({workspaces.layer(s)}), "New chat"), "workspace menu uses harness-neutral New chat text")
+workspace_action(s, "dialog", "open"); flush()
+local plan, surveys = nil, 0
+for index = before_harnesses + 1, #calls do
+    if calls[index].op == "launch-plan" then plan = calls[index] end
+    if calls[index].op == "harnesses" then surveys += 1 end
+end
+check(plan and plan.harness == "codex" and plan.cwd == "/mount/other" and not plan.project_id and surveys == 0, "installed default launches directly in the checkout")
+check(launched[#launched].cwd == "/mount/other" and launched[#launched].pane == 1 and not launched[#launched].resuming, "workspace launch reaches the normal origin-targeted fresh-chat boundary")
+settings.default_harness = nil
+workspace_action(s, "open", "other")
+check(s.picker and s.picker.kind == "harness" and s.picker.subtitle_backup == "Start in other", "no default opens the standard picker and retains the checkout subtitle while checking tools")
+flush()
+check(s.picker.subtitle == "Start in other", "ready workspace picker shows the checkout subtitle")
+action(s, "choose"); flush()
+check(launched[#launched].cwd == "/mount/other" and launched[#launched].command == "codex --fixture", "picker choice launches in the checkout")
+settings.default_harness = "omp"; launch_error = "OMP CLI is not installed"
+workspace_action(s, "open", "other"); flush()
+check(s.picker and s.picker.kind == "harness" and s.default_unavailable ~= nil, "unavailable default falls back through Projects' standard picker")
+launch_error = nil; action(s, "close")
+view(s)
+s.workspaces.selected = "checkout:unassigned:/tmp/ws-test/other:other"
+settings.default_harness = "codex"
+panel.key(s, {name = "n", ctrl = true, shift = true}, cx)
+check(s.picker and s.picker.subtitle_backup == "Start in other", "workspace New chat with shortcut uses the selected checkout")
+flush()
+check(s.picker.subtitle == "Start in other", "keyboard picker restores the checkout subtitle after tool discovery")
+action(s, "close")
+s.workspaces.selected = nil
+for _, key in {{name = "n", ctrl = true}, {name = "n", meta = true}} do
+    check(not workspaces.key(s, key), "New chat without a checkout falls through to the panel")
+    local before_launch = #launched
+    panel.key(s, key, cx); flush()
+    check(#launched == before_launch + 1 and launched[#launched].cwd == s.ctx_cwd, "panel New chat still works without a selected workspace")
+end
 workspaces.leave(s)
 local p = start("projects")
 action(p, "create"); flush(); action(p, "editor", "save"); flush()
@@ -362,7 +521,7 @@ check(p.mode == "projects" and not p.editor, "Projects-origin cancellation remai
 print("Workspace frontend: " .. tostring(assertions) .. " assertions passed (no model or network)")
 '''
     modules = []
-    for name in ("textfield", "fmt", "input", "ui", "project-editor", "resume", "chat-launch", "workspaces", "panel"):
+    for name in ("textfield", "fmt", "input", "ui", "picker", "project-editor", "resume", "chat-launch", "workspaces", "panel"):
         path = root / ("blocks/panel.luau" if name == "panel" else f"lib/{name}.luau")
         modules.append(f'modules["{name}"] = (function()\n{path.read_text()}\nend)()')
     fixture = fixture.replace("__MODULES__", "\n".join(modules))

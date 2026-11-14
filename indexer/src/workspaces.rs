@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 #[derive(Debug, Deserialize)]
@@ -31,7 +31,34 @@ pub struct Agent {
     pub live: bool,
 }
 
-fn command(program: &str, args: &[&str]) -> Command {
+// Discovery performs filesystem checks only: opening Projects must not start OVNFS.
+fn executable(home: &Path) -> Option<PathBuf> {
+    let mut directories: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).filter(|p| !p.as_os_str().is_empty()).collect())
+        .unwrap_or_default();
+    directories.push(home.join(".local/bin"));
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        directories.push(PathBuf::from(local).join("Programs/ovnfs"));
+    }
+    find_executable(&directories)
+}
+fn find_executable(directories: &[PathBuf]) -> Option<PathBuf> {
+    let names = crate::harnesses::executable_names("ovnfs");
+    for directory in directories {
+        for name in &names {
+            let path = directory.join(name);
+            if crate::harnesses::executable_file(&path) {
+                // Preserve the invoked name, as harness discovery does.
+                return if path.is_absolute() { Some(path) }
+                    else { std::env::current_dir().ok().map(|cwd| cwd.join(path)) };
+            }
+        }
+    }
+    None
+}
+
+fn command(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Command {
     let mut command = Command::new(program);
     command.args(args);
     // OVNFS also spawns Git. Never let the launching shell select another repository,
@@ -49,8 +76,8 @@ fn command(program: &str, args: &[&str]) -> Command {
     }
     command
 }
-fn run(program: &str, args: &[&str]) -> Result<Output> {
-    command(program, args).output().with_context(|| format!("cannot run {program}"))
+fn run(program: &Path, args: &[&str]) -> Result<Output> {
+    command(program, args).output().with_context(|| format!("cannot run {}", program.display()))
 }
 fn output(out: Output, conflicts: bool) -> Result<Value> {
     let value = serde_json::from_slice::<Value>(&out.stdout);
@@ -60,7 +87,7 @@ fn output(out: Output, conflicts: bool) -> Result<Value> {
     }
     bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
 }
-fn ovnfs(args: &[&str], conflicts: bool) -> Result<Value> { output(run("ovnfs", args)?, conflicts) }
+fn ovnfs(executable: &Path, args: &[&str], conflicts: bool) -> Result<Value> { output(run(executable, args)?, conflicts) }
 fn git_output(path: &str, args: &[&str]) -> Result<Output> {
     command("git", &["-C", path]).args(args).output().context("cannot run git")
 }
@@ -73,6 +100,19 @@ fn real_path(path: &str) -> Result<String> {
     let path = plain_path(std::fs::canonicalize(path)?);
     let text = path.to_str().context("path is not Unicode")?;
     Ok(if cfg!(windows) { text.replace('\\', "/") } else { text.to_owned() })
+}
+// Deleted agent cwds still belong to their checkout, even through macOS /var aliases.
+fn agent_location(path: &str) -> Option<String> {
+    if let Ok(location) = real_path(path) { return Some(location); }
+    for ancestor in Path::new(path).ancestors().skip(1) {
+        if let Ok(root) = real_path(ancestor.to_str()?) {
+            let suffix = Path::new(path).strip_prefix(ancestor).ok()?;
+            let location = Path::new(&root).join(suffix);
+            let text = location.to_str()?;
+            return Some(if cfg!(windows) { text.replace('\\', "/") } else { text.to_owned() });
+        }
+    }
+    None
 }
 fn capture_root(source: &str) -> Result<String> {
     let source = real_path(source)?;
@@ -94,19 +134,19 @@ fn busy(db: &Path) -> Result<bool> {
     let file = lock_file(db)?;
     match FileExt::try_lock_shared(&file) {
         Ok(()) => Ok(false),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Ok(true),
         Err(e) => Err(e.into()),
     }
 }
-fn status() -> Result<Value> {
-    let out = match run("ovnfs", &["status", "--json"]) {
+fn status(executable: Option<&Path>) -> Result<Value> {
+    let Some(executable) = executable else {
+        return Ok(json!({"state":"missing"}));
+    };
+    let out = match run(executable, &["status", "--json"]) {
         Ok(out) => out,
-        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-            return Ok(json!({"state":"missing", "error":"OVNFS is not installed or is not on PATH."})),
         Err(e) => return Ok(json!({"state":"error", "error":format!("{e:#}")})),
     };
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-    if out.status.code() == Some(127) { return Ok(json!({"state":"missing", "error":stderr})); }
     if out.status.code() == Some(1) && out.stdout.is_empty() && stderr == "not running" {
         return Ok(json!({"state":"stopped", "error":"OVNFS is not running."}));
     }
@@ -127,8 +167,8 @@ fn timestamp_key(value: &Value) -> Option<(&str, u32)> {
     }
     Some((date, nanos * 10u32.pow(9 - fraction.len() as u32)))
 }
-fn listing() -> Result<Value> {
-    let mut data = ovnfs(&["ls", "--json"], false)?;
+fn listing(executable: &Path) -> Result<Value> {
+    let mut data = ovnfs(executable, &["ls", "--json"], false)?;
     let snapshots = data.as_object_mut().context("OVNFS listing must be an object")?
         .remove("snapshots").context("OVNFS snapshots missing")?;
     let snapshots = snapshots.as_array().context("OVNFS snapshots must be an array")?;
@@ -150,10 +190,10 @@ fn listing() -> Result<Value> {
     }
     Ok(data)
 }
-fn checkout(req: &Request) -> Result<Value> {
+fn checkout(executable: &Path, req: &Request) -> Result<Value> {
     let name = req.name.as_deref().context("workspace name required")?;
-    ensure!(status()?["state"] == "running", "OVNFS is not running; refresh its status first");
-    let data = listing()?;
+    ensure!(status(Some(executable))?["state"] == "running", "OVNFS is not running; refresh its status first");
+    let data = listing(executable)?;
     let c = data["checkouts"].as_array().unwrap().iter().find(|c| c["name"] == name)
         .context("workspace no longer exists; refresh")?;
     ensure!(req.identity.as_deref() == c["identity"].as_str(), "workspace identity changed; refresh");
@@ -201,8 +241,8 @@ fn commits(c: &Value) -> Result<Value> {
     } else { Vec::new() };
     Ok(json!({"count":count, "tip":tip, "head":head, "titles":titles, "refs":refs}))
 }
-fn details(c: &Value) -> Result<Value> {
-    let diff = ovnfs(&["diff", c["name"].as_str().unwrap(), "--json"], false)?;
+fn details(executable: &Path, c: &Value) -> Result<Value> {
+    let diff = ovnfs(executable, &["diff", c["name"].as_str().unwrap(), "--json"], false)?;
     let (commits, error) = match commits(c) {
         Ok(v) => (v, Value::Null),
         Err(e) => (Value::Null, json!(format!("Cannot count commits: {e:#}"))),
@@ -210,9 +250,9 @@ fn details(c: &Value) -> Result<Value> {
     let token = hash(&json!([c["identity"], c["touched"], diff, commits]));
     Ok(json!({"changes":diff["changes"], "commits":commits, "error":error, "token":token}))
 }
-fn preview(c: &Value) -> Result<Value> {
-    let mut result = ovnfs(&["apply", c["name"].as_str().unwrap(), "--dry-run", "--json"], true)?;
-    let info = details(c)?;
+fn preview(executable: &Path, c: &Value) -> Result<Value> {
+    let mut result = ovnfs(executable, &["apply", c["name"].as_str().unwrap(), "--dry-run", "--json"], true)?;
+    let info = details(executable, c)?;
     result["token"] = json!(hash(&json!([info["token"], result])));
     result["details"] = info;
     Ok(result)
@@ -223,7 +263,7 @@ fn validate_name(name: &str) -> Result<()> {
     ensure!(name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b)), "Invalid workspace name");
     Ok(())
 }
-fn save_branch(c: &Value, branch: &str) -> Result<Value> {
+fn save_branch(executable: &Path, c: &Value, branch: &str) -> Result<Value> {
     ensure!(c["git"] == true, "This workspace is not a Git repository");
     ensure!(!branch.starts_with('-') && !branch.is_empty(), "A new branch name is required");
     let source = c["source"].as_str().unwrap();
@@ -231,18 +271,18 @@ fn save_branch(c: &Value, branch: &str) -> Result<Value> {
     let reference = format!("refs/heads/{branch}");
     let exists = git_output(source, &["show-ref", "--verify", "--quiet", &reference])?;
     ensure!(exists.status.code() == Some(1), "Branch already exists or cannot be checked; choose a new branch");
-    ovnfs(&["apply", c["name"].as_str().unwrap(), "--branch", branch, "--json"], false)
+    ovnfs(executable, &["apply", c["name"].as_str().unwrap(), "--branch", branch, "--json"], false)
 }
 
-fn authorize(req: &Request) -> Result<Value> {
+fn authorize(executable: &Path, req: &Request) -> Result<Value> {
     // Always use a successful current listing, not the panel's last (possibly failed) poll.
-    let mut c = checkout(req)?;
+    let mut c = checkout(executable, req)?;
     let raw = c["path"].as_str().context("workspace path missing")?;
     let root = real_path(raw).context("Cannot resolve workspace path")?;
     let mut locations = serde_json::Map::new();
     for agent in req.agents.as_ref().context("Fresh Tern agent snapshot required")? {
         let Some(cwd) = agent.cwd.as_deref() else { continue; };
-        let location = real_path(cwd).ok();
+        let location = agent_location(cwd);
         let inside = if let Some(path) = location.as_deref() {
             Path::new(path).starts_with(&root)
         } else {
@@ -261,21 +301,24 @@ fn authorize(req: &Request) -> Result<Value> {
     c["agent_locations"] = Value::Object(locations);
     Ok(c)
 }
-fn removal_details(req: &Request, c: &Value) -> Result<Value> {
-    let info = details(c)?;
+fn removal_details(executable: &Path, req: &Request, c: &Value) -> Result<Value> {
+    let info = details(executable, c)?;
     ensure!(req.expected.as_deref() == info["token"].as_str(), "Workspace changed; cancel and review removal again");
     ensure!(info["error"].is_null(), "Cannot safely check unreturned commits; fix the Git error first");
     Ok(info)
 }
 
-pub fn dispatch(db: &Path, req: Request) -> Result<Value> {
-    if req.action == "authorize" { return authorize(&req); }
+pub fn dispatch(db: &Path, home: &Path, req: Request) -> Result<Value> {
+    if req.action == "detect" {
+        let path = executable(home).map(plain_path);
+        return Ok(json!({"available":path.is_some(), "path":path}));
+    }
     if req.action == "resolve" || req.action == "roots" {
         let mut result = serde_json::Map::new();
         for path in req.paths.as_ref().context("paths required")? {
             if result.contains_key(path) { continue; }
             let value = if req.action == "resolve" {
-                json!(real_path(path).ok())
+                json!(agent_location(path))
             } else {
                 match capture_root(path) {
                     Ok(source) => json!({"source":source}),
@@ -286,62 +329,65 @@ pub fn dispatch(db: &Path, req: Request) -> Result<Value> {
         }
         return Ok(Value::Object(result));
     }
+    let executable = executable(home);
     if req.action == "poll" {
-        let mut state = status()?;
+        let mut state = status(executable.as_deref())?;
         state["busy"] = json!(busy(db)?);
         if state["state"] == "running" {
-            match listing() {
+            match listing(executable.as_deref().context("OVNFS is not installed")?) {
                 Ok(data) => { state["checkouts"] = data["checkouts"].clone(); },
                 Err(e) => { state["state"] = json!("error"); state["error"] = json!(format!("{e:#}")); },
             }
         }
         return Ok(state);
     }
-    if req.action == "details" { return details(&checkout(&req)?); }
-    if req.action == "preview" { return preview(&checkout(&req)?); }
+    let executable = executable.as_deref().context("OVNFS is not installed")?;
+    if req.action == "authorize" { return authorize(executable, &req); }
+    if req.action == "details" { return details(executable, &checkout(executable, &req)?); }
+    if req.action == "preview" { return preview(executable, &checkout(executable, &req)?); }
     // The OS-held guard outlives a plugin reload with its CLI child. No journal and no replay.
     let guard = lock_file(db)?;
     guard.try_lock_exclusive().context("A workspace operation is still running; refresh before trying again")?;
-    if req.action == "start" { return ovnfs(&["--json", "start"], false); }
+    if req.action == "start" { return ovnfs(executable, &["--json", "start"], false); }
     if req.action == "new" {
         let name = req.name.as_deref().context("workspace name required")?;
         validate_name(name)?;
-        ensure!(status()?["state"] == "running", "Start OVNFS first");
+        ensure!(status(Some(executable))?["state"] == "running", "Start OVNFS first");
         let source = req.source.as_deref().context("source folder required")?;
         ensure!(Path::new(source).is_absolute(), "Choose an absolute source folder");
         ensure!(capture_root(source)? == real_path(source)?, "Capture root changed; reopen New workspace to review its actual target");
-        return ovnfs(&["new", source, "--name", name, "--json"], false);
+        return ovnfs(executable, &["new", source, "--name", name, "--json"], false);
     }
-    let c = checkout(&req)?;
+    let c = checkout(executable, &req)?;
     let name = c["name"].as_str().unwrap();
     match req.action.as_str() {
         "fork" => {
             let child = req.branch.as_deref().context("fork name required")?;
             validate_name(child)?;
-            ovnfs(&["fork", name, "--name", child, "--json"], false)
+            ovnfs(executable, &["fork", name, "--name", child, "--json"], false)
         },
         "apply" => {
-            let current = preview(&c)?;
+            let current = preview(executable, &c)?;
             ensure!(req.expected.as_deref() == current["token"].as_str(), "Preview changed; cancel and preview again");
-            ovnfs(&["apply", name, "--json"], true)
+            ovnfs(executable, &["apply", name, "--json"], true)
         },
         "save-before-remove" => {
-            let info = removal_details(&req, &c)?;
+            let info = removal_details(executable, &req, &c)?;
             ensure!(info["commits"]["head"].is_string(),
                 "The checked-out branch has no commits yet. Switch the workspace to a retained branch containing these commits, then use Save branch.");
-            save_branch(&c, req.branch.as_deref().context("new branch required")?)?;
-            let current = checkout(&req)?;
-            let after = details(&current)?;
+            save_branch(executable, &c, req.branch.as_deref().context("new branch required")?)?;
+            let current = checkout(executable, &req)?;
+            let after = details(executable, &current)?;
             ensure!(after["error"].is_null() && info["changes"] == after["changes"] && info["commits"] == after["commits"],
                 "Workspace changed while saving the branch; review removal again. The branch was saved.");
             // The frontend must obtain another fresh agent authorization before requesting remove.
             Ok(json!({"token":after["token"]}))
         },
         "remove" => {
-            removal_details(&req, &c)?;
-            ovnfs(&["rm", name, "--json"], false)
+            removal_details(executable, &req, &c)?;
+            ovnfs(executable, &["rm", name, "--json"], false)
         },
-        "branch" => save_branch(&c, req.branch.as_deref().context("new branch required")?),
+        "branch" => save_branch(executable, &c, req.branch.as_deref().context("new branch required")?),
         _ => bail!("unknown workspace operation"),
     }
 }
@@ -379,5 +425,20 @@ mod tests {
         assert!(busy(&db).unwrap());
         drop(guard);
         assert!(!busy(&db).unwrap());
+    }
+    #[test]
+    fn discovery_checks_executable_files_in_directory_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let installed = temp.path().join(".local/bin");
+        std::fs::create_dir_all(&installed).unwrap();
+        let path = installed.join(if cfg!(windows) { "ovnfs.exe" } else { "ovnfs" });
+        std::fs::write(&path, b"fixture executable; discovery must not run it").unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(find_executable(std::slice::from_ref(&installed)).is_none());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(find_executable(&[missing, installed]).unwrap().canonicalize().unwrap(), path.canonicalize().unwrap());
     }
 }

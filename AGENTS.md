@@ -24,9 +24,9 @@ cargo clippy --locked --manifest-path indexer/Cargo.toml --all-targets -- -D cli
 python3 scripts/check-luau.py                          # Requires luau-compile 0.745
 python3 scripts/test_chat_launch.py                    # Requires Luau CLI 0.745
 python3 scripts/test_recents.py                        # Requires Luau CLI 0.745; Recents scope, no model
-python3 scripts/test-workspace-agents.py               # Requires Luau; native-state/result lifecycle, no model
-python3 scripts/test-workspaces.py                    # Requires Luau; grouping, bounded details and editor routing, no model
 python3 scripts/test_follow_cwd.py                     # Requires Luau CLI 0.745; panel folder follows the tab's terminal, no window
+python3 scripts/test-workspaces.py                     # Optional tab, launch, dialogs and mutation guards
+python3 scripts/test-workspace-agents.py               # Lazy native Tern agent tracking
 actionlint                                           # Requires actionlint 1.7.12
 shellcheck scripts/*.sh                              # Requires ShellCheck 0.11.0
 tern plugin types .                                  # Regenerate tern.d.luau after Tern updates
@@ -46,10 +46,10 @@ tern plugin reload                                   # Reload plugin in running 
 | --- | --- |
 | `host.luau` | Host process: start update checks, register the panel, manage shared state. |
 | `window.luau` | Window process: shortcuts, native settings, toggles, `tern-projects://launch`, `tern-projects://resume` and `tern-projects://follow` routes. |
-| `blocks/panel.luau`, `styles.css` | Projects, Workspaces, Search, and Settings UI. |
+| `blocks/panel.luau`, `styles.css` | Projects, optional Workspaces, Search, and Settings UI. |
 | `lib/backend.luau`, `lib/cli.luau` | Cargo builds, binary cache, request queue, CLI JSON, deletion/update coordination. |
 | `lib/updates.luau` | Host-only update checks, consent-gated installation, recovery. |
-| `lib/workspaces.luau`, `lib/workspace-agents.luau`, `indexer/src/workspaces.rs` | Workspaces UI/request pool, window-native agent/result bridge, and the sole OVNFS/Git management adapter. |
+| `lib/workspaces.luau`, `lib/workspace-agents.luau`, `indexer/src/workspaces.rs` | Optional OVNFS view, lazy window agent bridge, guarded checkout operations. |
 | `lib/chat-launch.luau`, `lib/resume.luau` | Origin-targeted host tab launches and ACP resume command selection. |
 | `lib/follow-cwd.luau` | Window-only: per-tab last focused terminal/agent, pushes its folder to the tab's panels; `follow?` route for Refresh. |
 | `lib/input.luau`, `lib/textfield.luau` | Shortcuts, UTF-16 native edits, UTF-8 text fields. |
@@ -60,6 +60,7 @@ tern plugin reload                                   # Reload plugin in running 
 | `indexer/src/harnesses.rs`, `indexer/src/adapters/`, `indexer/src/delete*.rs` | Verified harness discovery/launch, session parsing, fail-closed source deletion. |
 | `indexer/tests/` | Real-binary integration tests. |
 | `scripts/build.sh`, `scripts/check-luau.py`, `.github/workflows/ci.yml` | Release build, Luau compilation, CI checks. |
+| `scripts/test-workspaces.py`, `scripts/test-workspace-agents.py` | Optional-tab, workspace launch/safety, and lazy native-agent regressions. |
 | `scripts/pr_staleness.py`, `scripts/test_pr_staleness.py`, `.github/workflows/pr-staleness.yml` | Daily PR inactivity labels, persistent activity clock, transition tests. |
 | `plugin.toml`, `CHANGELOG.md`, `CONTRIBUTING.md`, `docs/` | Manifest, release notes, contributor workflow, technical guides and showcase assets. |
 | `bin/tern-projects`, `tern.d.luau` | Gitignored build output and generated Tern declarations. |
@@ -78,6 +79,19 @@ For a new harness, follow [docs/adding-a-harness.md](docs/adding-a-harness.md) r
 - Retained membership survives index rebuilds, cascades on project removal, and is cleared for verified UIDs during permanent chat deletion. Upgrade schema v1 transactionally without overwriting projects, annotations, or settings.
 - Library schema v3 adds `ignored_sources(path,resolved)`; the normalized path is each rule's removal identity. Upgrade v1/v2 transactionally. Ignores match whole path components of cwd, repository root, and worktree root, and filter before counts/paging in every projection. Never turn ignores into archive/assignment changes or source deletion; project-save retention reads unfiltered sessions.
 
+## Workspace safety
+
+- Detect the OVNFS executable through `PATH` and official user-local installation directories, and invoke only that resolved path. Missing means no executable, not a stopped or broken daemon. Detection must not spawn OVNFS.
+- Cache availability and its resolved path/search environment in host KV, not pane `save()`. Hide missing installations from navigation, cycling and keyboard help; re-detect once on panel open and explicit Refresh, never on the chat-index timer. The window bridge registers only a route until Workspaces requests it; no initial timers, pane scans or agent subscriptions.
+- OVNFS owns checkout state; never persist a checkout list. Poll only the visible Workspaces view, probe `status` before `ls` (which otherwise auto-starts), inherit daemon environment, and use `diff --json` rather than `dirty` for source changes. Cache details by identity, touched and daemon pid; cap management requests at three.
+- Bootstrap visibility with one window snapshot request. Hidden views must not request agent snapshots or resolve agent paths; agent payloads must not redraw Projects/Search/Settings. After a bounded wait without a window response, allow listing with unknown agent status, never bypass mutation authorization. KV read failures mean unknown agent results, not recurring native-hook errors.
+- Canonicalize workspace and agent locations, resolving surviving ancestors for deleted agent cwds. Revalidate checkout identity, change tokens, Git history and fresh generic Tern agent snapshots before apply/removal; reject unsafe operations without replay. Use the OS operation lock across CLI requests and plugin reloads, recognizing platform-specific lock-contention errors.
+- Workspace New chat uses Projects' default-harness/picker flow with a checkout `cwd`, never a hardcoded harness. Git subfolder captures must explicitly show and validate the repository root.
+- Re-read native agents inside the mutation's admitted request slot and require a fresh successful checkout listing. Finish slow path/list preparation, then take and check a final native snapshot immediately before mutation; a newly unknown cwd requires retry. Working/waiting blocks Apply, any live agent blocks removal. Resolve both sides to real paths; unresolved cwds lexically under either checkout spelling still belong there, while unrelated unresolved cwds are skipped. Save-before-remove is a separate backend stage followed by both checks again. Check identities and fresh preview/detail tokens in the backend. Apply conflicts are successful structured results, never automatic retries.
+- Workspace mutations use a separate OS-held lock, retained by the CLI across plugin reloads, not an operation journal. Re-read state after reload and do not replay. Branch preservation refuses existing refs; removal warns about excluded files and unreturned commits. Only explicitly confirmed OVNFS checkout removal is allowed; never delete source folders.
+- Discard inherited Git repository/index/object/ref-selection environment overrides for both Git and OVNFS children. Resolve curated Git subfolders to their capture root before showing creation confirmation and group checkouts by that root. An unborn source is an empty commit base; corrupt/unreadable Git metadata remains an error. Cancelled request generations must invalidate loading detail entries.
+- An unborn checkout HEAD does not imply empty history: count all surviving refs against the source tip, fail closed on unreadable refs/objects. Library refresh is not view leave: retain workspace dialogs/drafts. Gate unassigned classification on successful Mine/root snapshots; keep exact stored-source associations for unavailable folders, surface their errors and retry resolution.
+
 ## Backend builds
 
 - `lib/backend.luau` builds with Cargo at plugin load, caches the binary in `<plugin.data>/backend/`, and queues requests until the build settles.
@@ -93,14 +107,6 @@ For a new harness, follow [docs/adding-a-harness.md](docs/adding-a-harness.md) r
 - Pending installation status survives reload. On disk-confirmed success, persist `completed_version` and remove pending state. `window.luau` delivers the **Updated!** toast after reload without a panel, acknowledging it under `plugin-update-toast:v1`; the window must not rewrite host-owned updater preferences.
 - At startup, clear a saved installation failure only when the installed version reaches its target `latest_version`. Keep check failures with no target and failures targeting newer versions.
 - A shared host guard excludes installation and active permanent deletion, including queued deletions that become ready during installation. Update checks never modify the library/index.
-
-## Workspace safety
-
-- OVNFS owns checkout state; Projects owns curated folders. Poll only the Workspaces view, probe `status` before `ls` (which otherwise auto-starts), inherit daemon environment, and never use `dirty` for source-change counts. Cache details by checkout identity, touched and daemon pid; cap management requests at three.
-- Re-read native agents inside the mutation's admitted request slot and require a fresh successful checkout listing. Finish slow path/list preparation, then take and check a final native snapshot immediately before mutation; a newly unknown cwd requires retry. Working/waiting blocks Apply, any live agent blocks removal. Resolve both sides to real paths; unresolved cwds lexically under either checkout spelling still belong there, while unrelated unresolved cwds are skipped. Save-before-remove is a separate backend stage followed by both checks again. Check identities and fresh preview/detail tokens in the backend. Apply conflicts are successful structured results, never automatic retries.
-- Workspace mutations use a separate OS-held lock, retained by the CLI across plugin reloads, not an operation journal. Re-read state after reload and do not replay. Branch preservation refuses existing refs; removal warns about excluded files and unreturned commits. Only explicitly confirmed OVNFS checkout removal is allowed; never delete source folders.
-- Discard inherited Git repository/index/object/ref-selection environment overrides for both Git and OVNFS children. Resolve curated Git subfolders to their capture root before showing creation confirmation and group checkouts by that root. An unborn source is an empty commit base; corrupt/unreadable Git metadata remains an error. Cancelled request generations must invalidate loading detail entries.
-- An unborn checkout HEAD does not imply empty history: count all surviving refs against the source tip, fail closed on unreadable refs/objects. Library refresh is not view leave: retain workspace dialogs/drafts. Gate unassigned classification on successful Mine/root snapshots; keep exact stored-source associations for unavailable folders, surface their errors and retry resolution.
 
 ## Deletion safety
 

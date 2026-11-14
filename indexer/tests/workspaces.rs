@@ -6,6 +6,7 @@ fn command(root: &Path, request: Value) -> std::process::Child { command_env(roo
 fn command_env(root: &Path, request: Value, env: &[(&str, &str)]) -> std::process::Child {
     let mut child = Command::new(BIN).args(["--db", root.join("index.sqlite").to_str().unwrap(), "library"])
         .env("PATH", format!("{}:/usr/bin:/bin", root.display())).env("WS_FIXTURE", root).envs(env.iter().copied())
+        .env("TERN_PROJECTS_HOME", root.join("home"))
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     child.stdin.take().unwrap().write_all(json!({"op":"workspaces", "request":request}).to_string().as_bytes()).unwrap();
     child
@@ -39,6 +40,22 @@ esac
         "snapshots":[{"id":"snap", "checkout":"parent", "created":"2026-02-01T00:00:00Z"}]}).to_string()).unwrap();
     temp
 }
+#[test]
+fn detection_never_runs_ovnfs_and_off_path_operations_use_the_resolved_program() {
+    let t = fixture();
+    assert_eq!(value(call(t.path(), json!({"action":"detect"})))["available"], true);
+    assert!(!t.path().join("calls").exists(), "detection must not spawn OVNFS");
+    let installed = t.path().join("home/.local/bin");
+    fs::create_dir_all(&installed).unwrap();
+    fs::rename(t.path().join("ovnfs"), installed.join("ovnfs")).unwrap();
+    let invoke = |request| command_env(t.path(), request, &[("PATH", "/usr/bin:/bin")]).wait_with_output().unwrap();
+    assert_eq!(value(invoke(json!({"action":"detect"})))["available"], true);
+    assert!(!t.path().join("calls").exists());
+    assert_eq!(value(invoke(json!({"action":"poll"})))["state"], "running");
+    value(invoke(json!({"action":"start"})));
+    assert_eq!(fs::read_to_string(t.path().join("calls")).unwrap(), "status --json\nls --json\n--json start\n");
+}
+
 #[test]
 fn stopped_and_error_never_list_or_autostart() {
     let t = fixture();
@@ -141,7 +158,7 @@ fn repository_selection_environment_is_removed_from_git_and_ovnfs() {
     assert!(!existing.status.success());
     assert!(String::from_utf8_lossy(&existing.stderr).contains("Branch already exists"));
     value(invoke(json!({"action":"branch","name":"parent","identity":c["identity"],"branch":"new-branch"})));
-    assert_eq!(value(invoke(json!({"action":"roots","paths":[source]})))[source.to_str().unwrap()]["source"], json!(source));
+    assert_eq!(value(invoke(json!({"action":"roots","paths":[source]})))[source.to_str().unwrap()]["source"], json!(source.canonicalize().unwrap()));
 }
 #[test]
 fn authorization_uses_real_paths_and_current_successful_listing() {
@@ -151,7 +168,7 @@ fn authorization_uses_real_paths_and_current_successful_listing() {
     let alias = t.path().join("mount-alias");
     std::os::unix::fs::symlink(&checkout, &alias).unwrap();
     let c = set_checkout(t.path(), t.path(), &alias, false);
-    assert_eq!(c["location"], json!(checkout));
+    assert_eq!(c["location"], json!(checkout.canonicalize().unwrap()));
     let authorize = |state: &str, live: bool, removing: bool| call(t.path(), json!({
         "action":"authorize","name":"parent","identity":c["identity"],"removing":removing,
         "agents":[{"cwd":checkout.join("nested"),"state":state,"live":live},
@@ -262,7 +279,7 @@ fn subfolder_capture_root_is_explicit_and_validated_before_creation() {
     let folder = source.join("app");
     fs::create_dir(&folder).unwrap();
     let roots = value(call(t.path(), json!({"action":"roots","paths":[folder]})));
-    assert_eq!(roots[folder.to_str().unwrap()]["source"], json!(source));
+    assert_eq!(roots[folder.to_str().unwrap()]["source"], json!(source.canonicalize().unwrap()));
     assert!(!call(t.path(), json!({"action":"new","source":folder,"name":"test"})).status.success());
     value(call(t.path(), json!({"action":"new","source":source,"name":"test"})));
     let calls = fs::read_to_string(t.path().join("calls")).unwrap();

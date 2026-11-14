@@ -1,14 +1,15 @@
 --!strict
--- Window-only bridge. Native Tern state, never terminal scraping, prompts or OMP configuration.
+-- Window-only bridge. Native Tern agent state, independent of the selected harness.
 local fmt = require("./fmt")
 local M = {}
 local KEY = "workspace-results:v1"
 local known: {[string]: any} = {}
 local loaded = false
+local enabled, routed = false, false
 
 local function results(): any
 	local ok, value = pcall(tern.kv.get, KEY)
-	if not ok then error("Cannot read workspace agent results: " .. tostring(value)) end
+	if not ok then return {} end
 	return if type(value) == "table" then value else {}
 end
 local function panes(cx: any): any
@@ -70,11 +71,12 @@ local function publish(cx: any)
 		end
 	end
 end
-function M.start()
+local function activate()
+	enabled = true
 	if loaded then return end
 	loaded = true
 	tern.on("agent_state", function(ev: any, cx: any)
-		if not cx then return end
+		if not enabled or not cx then return end
 		if ev.new == "working" or ev.new == "waiting_input" then
 			local marks, key = results(), tostring(ev.pane)
 			if marks[key] then marks[key] = nil; tern.kv.set(KEY, marks) end
@@ -82,7 +84,7 @@ function M.start()
 		publish(cx)
 	end)
 	tern.on("agent_finished", function(ev: any, cx: any)
-		if not cx then return end
+		if not enabled or not cx then return end
 		local key = tostring(ev.pane)
 		local row = known[key]
 		if not row then M.snapshot(cx); row = known[key] end
@@ -102,19 +104,29 @@ function M.start()
 		publish(cx)
 	end)
 	tern.on("focus", function(ev: any, cx: any)
-		if not cx then return end
+		if not enabled or not cx then return end
 		-- Seeing a tab acknowledges its finished marks, not only its focused split.
 		local marks = results()
 		if acknowledge(marks, panes(cx), ev.tab) then tern.kv.set(KEY, marks) end
 		publish(cx)
 	end)
-	tern.on("pane_closed", function(_ev: any, cx: any) if cx then publish(cx) end end)
-	tern.timer(300, function(cx: any) if cx then publish(cx) end end)
+	tern.on("pane_closed", function(_ev: any, cx: any) if enabled and cx then publish(cx) end end)
+end
+function M.start()
+	if routed then return end
+	routed = true
+	-- Register only a route until a detected Workspaces view asks for agent state.
+	-- No startup timer, pane enumeration, KV reads or agent subscriptions when unused.
 	tern.route.link(function(link: any, cx: any)
 		local q = string.match(link.url, "^tern%-projects://workspace%?(.*)$")
 		if not q or not link.pane then return nil end
+		if not cx then return {handled = true} end
 		local origin = panes(cx)[tostring(link.pane)]
 		if not origin or origin.block ~= "tern-projects.panel" or cx.hosts:current().kind ~= "local" then return {handled = true} end
+		if q == "disable=1" then enabled = false; return {handled = true} end
+		local ok, availability = pcall(tern.kv.get, "workspace-availability:v1")
+		if not ok or type(availability) ~= "table" or availability.available ~= true then return {handled = true} end
+		activate()
 		local focus = tonumber(string.match(q, "focus=(%d+)"))
 		if focus then
 			for _, row in M.snapshot(cx) do

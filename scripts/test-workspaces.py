@@ -362,7 +362,7 @@ check(p.mode == "projects" and not p.editor, "Projects-origin cancellation remai
 print("Workspace frontend: " .. tostring(assertions) .. " assertions passed (no model or network)")
 '''
     modules = []
-    for name in ("textfield", "fmt", "input", "ui", "project-editor", "workspaces", "panel"):
+    for name in ("textfield", "fmt", "input", "ui", "project-editor", "resume", "chat-launch", "workspaces", "panel"):
         path = root / ("blocks/panel.luau" if name == "panel" else f"lib/{name}.luau")
         modules.append(f'modules["{name}"] = (function()\n{path.read_text()}\nend)()')
     fixture = fixture.replace("__MODULES__", "\n".join(modules))

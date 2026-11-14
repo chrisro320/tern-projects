@@ -8,11 +8,11 @@ Thank you for your interest in contributing to `tern-projects`!
 
 ---
 
-## Open an Issue First
+## Issues for AI-Assisted Bug Fixes
 
-Every pull request must have a related issue opened before the PR. Before starting work, search the [existing issues](https://github.com/thegeneralist01/tern-projects/issues). If none covers your proposed change, open one describing the bug or improvement and the approach you plan to take.
+AI-assisted bug-fix PRs (not enhancement PRs!) must reference an issue. Reuse an existing issue or open one before the PR to discuss scope.
 
-Use the issue to discuss scope and avoid duplicate work. Link the issue in your PR description; use `Closes #123` when the PR fully resolves it, or `Refs #123` for related work.
+Search the [existing issues](https://github.com/thegeneralist01/tern-projects/issues) before creating a new one. Link the issue in your PR description; use `Closes #123` when the PR fully resolves it, or `Refs #123` for related work.
 
 ---
 
@@ -68,6 +68,8 @@ Whenever you modify Rust code in `indexer/`, run `./scripts/build.sh` (or `cargo
 
 - **Rust**: locked-dependency tests and Clippy correctness/suspicious-pattern checks on Linux, macOS (Intel), and Windows. The explicit `macos-15-intel` runner avoids arm64 runner-allocation failures.
 - **Luau**: compile runtime sources at the repository root and under `blocks/` and `lib/`, and require `--!strict` on the first line. Generated `*.d.luau` declarations are excluded. This checks syntax, not Tern SDK types or native UI behavior.
+- **Chat launches**: focused Luau regressions cover fallback authorization after a CLI timeout, expiry, and replay protection.
+- **Recents scope**: a focused Luau regression covers the **This folder** default, the snapshot payload, the empty and failed states, remembered scope across reopen, dropped stale responses, and keeping the Recents page.
 - **Workflows and shell**: actionlint validates GitHub Actions, including embedded shell commands; ShellCheck checks `scripts/*.sh`.
 - **PR inactivity automation**: unit tests cover week boundaries, progression, and activity resets.
 - **PR checks**: a stable aggregate status that fails if any dependency fails, is cancelled, or is skipped. Configure this status as required in the repository's `main` branch ruleset to block merges.
@@ -80,12 +82,14 @@ Run the same checks locally:
 cargo clippy --locked --manifest-path indexer/Cargo.toml --all-targets -- -D clippy::correctness -D clippy::suspicious
 cargo test --locked --manifest-path indexer/Cargo.toml
 python3 scripts/check-luau.py
+python3 scripts/test_chat_launch.py
+python3 scripts/test_recents.py
 actionlint
 python3 -B -m unittest discover -s scripts -p 'test_pr_staleness.py'
 shellcheck scripts/*.sh
 ```
 
-Install [Luau 0.745](https://github.com/luau-lang/luau/releases/tag/0.745) (`luau-compile`), [actionlint 1.7.12](https://github.com/rhysd/actionlint/releases/tag/v1.7.12), and [ShellCheck 0.11.0](https://github.com/koalaman/shellcheck/releases/tag/v0.11.0) on your `PATH`. The Luau checker also accepts `--compiler /path/to/luau-compile`. Keep tool versions and Linux archive checksums together in the workflow when upgrading them.
+Install [Luau 0.745](https://github.com/luau-lang/luau/releases/tag/0.745) (`luau-compile` and `luau`), [actionlint 1.7.12](https://github.com/rhysd/actionlint/releases/tag/v1.7.12), and [ShellCheck 0.11.0](https://github.com/koalaman/shellcheck/releases/tag/v0.11.0) on your `PATH`. The Luau checker accepts `--compiler /path/to/luau-compile`; the Luau regressions accept `--runtime /path/to/luau`. Keep tool versions and Linux archive checksums together in the workflow when upgrading them.
 
 Rust formatting and existing style/dead-code warnings are not gates in this workflow; the current tree does not have a clean strict-formatting/`-D warnings` baseline. Keep changes focused rather than reformatting unrelated code.
 
@@ -118,7 +122,7 @@ We have a dedicated, step-by-step technical guide covering adapter discovery, la
 2. Run the pull request checks above.
 3. Commit with a clear, conventional commit message (e.g. `feat: add goose agent adapter`).
 4. If you made structural or architectural changes, verify `AGENTS.md` is updated.
-5. Open a Pull Request on GitHub linking the issue opened beforehand and describing your changes and testing evidence.
+5. Open a Pull Request on GitHub describing your changes and testing evidence. For AI-assisted bug fixes, link the issue opened beforehand.
 
 ## PR Inactivity
 

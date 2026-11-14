@@ -41,7 +41,7 @@ local global_recent = {{uid = "all-1", title = "All one"}, {uid = "all-2", title
 local scoped_recent = {{uid = "repo-1", title = "Repo one"}}
 local projects, snapshot_error = {}, nil
 local calls, pending = {}, {}
-local modules = {picker = {}, updates = {get = function() return {} end, subscribe = function() return function() end end}}
+local modules = {picker = {}, resume = {}, updates = {get = function() return {} end, subscribe = function() return function() end end}}
 modules.cli = {
     status = function() return nil end,
     run = function(_, _, cb) if cb then cb({}) end end,
@@ -91,11 +91,10 @@ end
 local function shows(s, uid) return s.rows["recent:" .. uid] ~= nil end
 local function note(s, key) return s.rows[key] and s.rows[key].ref.label end
 local function start(saved)
-    local s = panel.init(cx, {"projects", "/tmp/recents/repo"}, saved)
-    return s
+    return panel.init(cx, {"projects", "/tmp/recents/repo"}, saved)
 end
 -- A new panel waits for its first snapshot instead of showing the previous scope.
-local s = panel.init(cx, {"projects", "/tmp/recents/repo"}, nil)
+local s = start(nil)
 check(s.recent_filter == "folder", "Recents defaults to This folder")
 check(#s.recent == 0 and note(s, "recent:wait") == "Loading chats…", "a new panel shows a loading state")
 flush()
@@ -226,14 +225,16 @@ action(retargeted, "refresh"); flush()
 check(table.find(opened, "tern-projects://follow?") ~= nil, "Refresh asks the window for the followed folder")
 print("Recents scope: " .. tostring(assertions) .. " assertions passed (no model or network)")
 '''
+    names = ("textfield", "fmt", "input", "ui", "project-editor", "picker", "resume", "chat-launch", "workspaces", "panel")
     modules = []
-    for name in ("textfield", "fmt", "input", "ui", "project-editor", "workspaces", "panel"):
+    for name in names:
         path = root / ("blocks/panel.luau" if name == "panel" else f"lib/{name}.luau")
-        modules.append(f'modules["{name}"] = (function()\n{path.read_text()}\nend)()')
+        source = path.read_text(encoding="utf-8")
+        modules.append(f'modules["{name}"] = (function()\n{source}\nend)()')
     fixture = fixture.replace("__MODULES__", "\n".join(modules))
     with tempfile.TemporaryDirectory(prefix="recents-") as directory:
         file = Path(directory) / "recents.luau"
-        file.write_text(fixture)
+        file.write_text(fixture, encoding="utf-8")
         return subprocess.run([runtime, str(file)], check=False).returncode
 
 

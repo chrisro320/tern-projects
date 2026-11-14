@@ -47,7 +47,7 @@ impl Transcript {
     }
 
     fn push_tool(&mut self, name: &str) {
-        if self.turns.last().map_or(true, |turn| turn.role != Role::Assistant) {
+        if self.turns.last().is_none_or(|turn| turn.role != Role::Assistant) {
             self.turns.push(Turn { role: Role::Assistant, parts: Vec::new() });
         }
         let parts = &mut self.turns.last_mut().expect("assistant turn").parts;

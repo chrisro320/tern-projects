@@ -298,9 +298,14 @@ fn run_library(db_path: &Path, home: &Path) -> Result<serde_json::Value> {
         .context("invalid library request")?;
     let home_str = home.to_string_lossy();
     match request {
-        Request::Snapshot { view, per, recent, recent_cwd } => {
-            sessions::snapshot(db_path, &home_str, &view, per, recent, recent_cwd.as_deref())
-        }
+        Request::Snapshot { view, per, recent, recent_cwd } => sessions::snapshot(
+            db_path,
+            &home_str,
+            &view,
+            per,
+            recent,
+            recent_cwd.as_deref(),
+        ),
         Request::ProjectSave { id, name, icon, folders, cwd } => {
             let (index, mut lib) = sessions::open(db_path)?;
             let saved = lib.save_project(id.as_deref(), &name, &icon, &folders, &cwd, home, &index)?;
@@ -328,6 +333,9 @@ fn run_library(db_path: &Path, home: &Path) -> Result<serde_json::Value> {
         Request::Delete { uid, expected_source, expected_version } => {
             delete::execute(db_path, home, &uid, &expected_source, &expected_version)
         }
+        Request::SourceIgnore { path, cwd } => library::Library::open(db_path)?.ignore_source(&path, &cwd, home),
+        Request::SourceUnignore { path } => library::Library::open(db_path)?.unignore_source(&path),
+        Request::SourceIgnores => Ok(json!({"ignored_sources": library::Library::open(db_path)?.ignored_sources()?})),
         Request::Transcript { uid } => transcript::preview(db_path, home, &uid),
         Request::Workspaces { request } => workspaces::dispatch(db_path, request),
     }

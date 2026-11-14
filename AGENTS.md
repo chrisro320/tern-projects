@@ -4,7 +4,11 @@
 
 ## Contribution workflow
 
-- Open an issue before a PR, or use an existing issue covering the change. Link it in the PR and describe changes and testing evidence. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and submission details.
+When working in a fork, after completing a change that could benefit upstream, briefly suggest contributing it if the user hasn’t already discussed doing so. Explain that draft PRs are very welcome and the maintainer is happy to help refine the contribution. Offer a friendly invitation once per session, and respect the user’s decision.
+
+AI-assisted bug-fix PRs (not enhancement PRs!) must reference an issue. Reuse an existing issue or open one before the PR to discuss scope.
+
+- Describe changes and testing evidence in the PR. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and submission details.
 - Prefer Jujutsu (`jj`) for version-control tasks; use Git if `jj` is unavailable. Do not run destructive version-control commands unless explicitly requested.
 - Keep changes focused. Update this file when the code map, commands, conventions, or core invariants change; do not turn it into a change log or an exhaustive file inventory.
 - Maintainers handle version bumps when publishing releases. Do not change `plugin.toml`'s version unless the maintainer requests a release; commits without a version increase do not trigger update notifications.
@@ -18,9 +22,10 @@ Prerequisites: Tern, stable Rust, and the check tools listed below. Run commands
 cargo test --locked --manifest-path indexer/Cargo.toml # Backend unit and integration tests
 cargo clippy --locked --manifest-path indexer/Cargo.toml --all-targets -- -D clippy::correctness -D clippy::suspicious
 python3 scripts/check-luau.py                          # Requires luau-compile 0.745
+python3 scripts/test_chat_launch.py                    # Requires Luau CLI 0.745
+python3 scripts/test_recents.py                        # Requires Luau CLI 0.745; Recents scope, no model
 python3 scripts/test-workspace-agents.py               # Requires Luau; native-state/result lifecycle, no model
 python3 scripts/test-workspaces.py                    # Requires Luau; grouping, bounded details and editor routing, no model
-python3 scripts/test-recents.py                       # Requires Luau; Recents All/This folder scope and persistence, no model
 python3 scripts/test-follow-cwd.py                    # Requires Luau; panel folder follows the tab's terminal, no window
 actionlint                                           # Requires actionlint 1.7.12
 shellcheck scripts/*.sh                              # Requires ShellCheck 0.11.0
@@ -45,10 +50,12 @@ tern plugin reload                                   # Reload plugin in running 
 | `lib/backend.luau`, `lib/cli.luau` | Cargo builds, binary cache, request queue, CLI JSON, deletion/update coordination. |
 | `lib/updates.luau` | Host-only update checks, consent-gated installation, recovery. |
 | `lib/workspaces.luau`, `lib/workspace-agents.luau`, `indexer/src/workspaces.rs` | Workspaces UI/request pool, window-native agent/result bridge, and the sole OVNFS/Git management adapter. |
+| `lib/chat-launch.luau`, `lib/resume.luau` | Origin-targeted host tab launches and ACP resume command selection. |
 | `lib/input.luau`, `lib/textfield.luau` | Shortcuts, UTF-16 native edits, UTF-8 text fields. |
 | `lib/ui.luau`, `lib/picker.luau`, `lib/project-editor.luau`, `lib/fmt.luau` | Shared widgets, selection sheets, project drafts/directory browser, formatting. |
 | `indexer/src/main.rs`, `indexer/src/model.rs`, `indexer/src/text.rs`, `indexer/src/git.rs` | CLI entry, data types, quoting/timestamps, Git/worktree resolution. |
 | `indexer/src/db.rs`, `indexer/src/library.rs`, `indexer/src/sessions.rs` | Disposable index, durable library, session projections/scopes/paging. |
+| `indexer/src/transcript.rs` | Read-only chat preview: parses OMP/Claude Code transcripts, condenses tool calls, fits Tern's update budget. |
 | `indexer/src/harnesses.rs`, `indexer/src/adapters/`, `indexer/src/delete*.rs` | Verified harness discovery/launch, session parsing, fail-closed source deletion. |
 | `indexer/tests/` | Real-binary integration tests. |
 | `scripts/build.sh`, `scripts/check-luau.py`, `.github/workflows/ci.yml` | Release build, Luau compilation, CI checks. |
@@ -68,6 +75,7 @@ For a new harness, follow [docs/adding-a-harness.md](docs/adding-a-harness.md) r
 - `index.sqlite` is rebuildable; index schema version bumps force reindexing. Never drop or clear durable `library.sqlite` during index rebuilds: it owns curated projects, folders, pins, chat assignments, and global settings.
 - Library schema v2 retains automatic memberships in `project_chats(project_id,uid)`. When saving changed source folders, capture matching indexed chats (including archived chats) under the library write lock before replacing folders. Explicit `project`/`none` assignments override retention; old paths must not remain live matching rules.
 - Retained membership survives index rebuilds, cascades on project removal, and is cleared for verified UIDs during permanent chat deletion. Upgrade schema v1 transactionally without overwriting projects, annotations, or settings.
+- Library schema v3 adds `ignored_sources(path,resolved)`; the normalized path is each rule's removal identity. Upgrade v1/v2 transactionally. Ignores match whole path components of cwd, repository root, and worktree root, and filter before counts/paging in every projection. Never turn ignores into archive/assignment changes or source deletion; project-save retention reads unfiltered sessions.
 
 ## Backend builds
 
@@ -106,4 +114,12 @@ For a new harness, follow [docs/adding-a-harness.md](docs/adding-a-harness.md) r
 - `tern-projects://shortcuts?`, `keyboard?`, and `keyconfig?` require a live focused Projects panel in the calling window. They only report bindings or invoke fixed `preferences` / `open_config` commands; never accept arbitrary commands or file paths.
 - While Settings is open, request a keymap snapshot every second. Stop stale polling through pane/generation liveness; identical snapshots must not redraw or disturb dialogs. Tern's Keyboard editor may omit unbound plugin actions: expose copyable IDs and the native settings-file command without inventing defaults.
 - Fresh chats use the primary project directory as `cwd`. Pass additional folders through supported harness flags (such as `--add-dir`), or warn before launching primary-only. Quote commands per OS: `shell_join` on Unix, Base64-encoded command blocks on Windows.
-- Fresh-chat URLs carry a per-nonce `launch:<nonce>` claim bound to the exact pane, command, and directory. Claims expire after 10 seconds and must be consumed before tab creation; they never replace a live focused Projects panel on the local host.
+- Open chat tabs through the host CLI, resolving the panel's exact window and session before creation and focus. Never fall back to the CLI's default target when the originating panel cannot be found.
+- Create fallback `launch:<nonce>` claims only after the CLI fails. Bind each claim to the exact pane, command, and directory; expire it after 10 seconds and consume it before tab creation. Link fallback still requires a live focused Projects panel on the local host.
+- Resolve Codex/Claude Resume commands at both launch boundaries: current persisted host ACP preferences for the CLI, and current window preferences for link fallback. Preserve backend/copy commands and `agents.auto_acp` / `agents.keep_tui` opt-outs.
+
+## Chat preview
+
+- The preview is read-only: the panel fetches the selected chat through the `transcript` library request and never launches an agent or adds a block. A selection moved by a reload or by search paging refetches it; `Esc`, `Space` on the shown chat, or the close button closes it.
+- Read only inside the harness's own history folder (`source` without its `agent:` prefix) and refuse any other path. Parse OMP and Claude Code; other harnesses keep the backend's "not available" notice, and no preview affordance is offered for them.
+- Return at most the newest 128 KiB of markdown from at most 400 turns, plus how many messages were omitted, so one canvas update stays inside Tern's limits. Hide thinking and tool output; condense consecutive tool calls to one line.

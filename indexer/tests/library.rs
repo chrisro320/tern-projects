@@ -544,6 +544,196 @@ fn failed_folder_change_rolls_back_retained_membership() {
     assert_eq!(conn.query_row("SELECT count(*) FROM project_chats", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
 }
 
+fn ignored(value: &Value) -> Vec<&str> {
+    value["ignored_sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rule| rule["path"].as_str().unwrap())
+        .collect()
+}
+fn total(db: &Path, home: &Path) -> Value {
+    run(db, home, &["query", "--q", "needle"])["total"].clone()
+}
+
+#[test]
+fn source_ignores_hide_everywhere_and_survive_migration_rebuild_and_unignore() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db = temp.path().join("index.sqlite");
+    let repo = home.join("repo");
+    let sub = repo.join("sub");
+    let worktree = home.join("wt");
+    let sibling = home.join("repo-sibling");
+    let mixed = home.join("mixed");
+    let gone = home.join("gone");
+    for folder in [&sub, &worktree, &sibling, &mixed] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    // `wt` is a linked worktree of `repo`; `gone` never exists on disk.
+    std::fs::create_dir_all(repo.join(".git/worktrees/w")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+    std::fs::write(repo.join(".git/worktrees/w/HEAD"), "ref: refs/heads/wt").unwrap();
+    std::fs::write(repo.join(".git/worktrees/w/commondir"), "../..").unwrap();
+    std::fs::write(worktree.join(".git"), "gitdir: ../repo/.git/worktrees/w").unwrap();
+    let source = seed(&home, "root", &repo, 100);
+    let original = std::fs::read(&source).unwrap();
+    seed(&home, "sub", &sub, 200);
+    seed(&home, "wt", &worktree, 300);
+    seed(&home, "sibling", &sibling, 400);
+    seed(&home, "mixed", &mixed, 500);
+    seed(&home, "gone", &gone.join("deep"), 600);
+    run(&db, &home, &["index"]);
+    fn path(p: &Path) -> String {
+        p.to_str().unwrap().to_owned()
+    }
+    // A real v2 library: explicit, retained, pinned and archived state.
+    let lib = temp.path().join("library.sqlite");
+    let conn = rusqlite::Connection::open(&lib).unwrap();
+    conn.execute_batch("
+        CREATE TABLE projects(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,icon TEXT NOT NULL,created_ms INTEGER NOT NULL);
+        CREATE TABLE project_folders(project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,position INTEGER NOT NULL,path TEXT NOT NULL,PRIMARY KEY(project_id,position),UNIQUE(project_id,path));
+        CREATE TABLE chat_state(uid TEXT PRIMARY KEY,assignment TEXT NOT NULL DEFAULT 'automatic',project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,pinned_ms INTEGER,archived_ms INTEGER);
+        CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE project_chats(project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,uid TEXT NOT NULL,PRIMARY KEY(project_id,uid));
+        INSERT INTO projects VALUES(1,'Repo','code',300),(2,'Mixed','code',200),(3,'Gone','code',100);
+        INSERT INTO chat_state VALUES('omp:sub','automatic',NULL,100,NULL),('omp:wt','automatic',NULL,NULL,100),('omp:mixed','project',1,NULL,NULL);
+        INSERT INTO project_chats VALUES(2,'omp:gone');
+        INSERT INTO settings VALUES('icon_style','\"monochrome\"');
+        PRAGMA user_version=2;").unwrap();
+    for (id, folder) in [(1, &repo), (2, &mixed), (3, &gone)] {
+        conn.execute("INSERT INTO project_folders VALUES(?,0,?)", rusqlite::params![id, path(folder)]).unwrap();
+    }
+    let before = snapshot(&db, &home);
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+    assert_eq!(before["ignored_sources"], json!([]));
+    assert_eq!(before["settings"]["icon_style"], "monochrome");
+    assert_eq!(uids(&before["pinned"]), ["omp:sub"]);
+    assert_eq!(uids(&project(&before, "1")["sessions"]), ["omp:mixed", "omp:sub", "omp:root"]);
+    assert_eq!(uids(&project(&before, "2")["sessions"]), ["omp:gone"]);
+    assert_eq!(uids(&project(&before, "3")["sessions"]), ["omp:gone"]);
+
+    let error = fails(&db, &home, json!({"op":"source-ignore","path":"repo"}));
+    assert!(error.contains("working directory"), "{error}");
+    assert!(ignored(&library(&db, &home, json!({"op":"source-ignores"}))).is_empty());
+    #[cfg(windows)]
+    {
+        let error = fails(&db, &home, json!({"op":"source-ignore","path":"Z:relative","cwd":home}));
+        assert!(error.contains("absolute path"), "{error}");
+        assert!(ignored(&library(&db, &home, json!({"op":"source-ignores"}))).is_empty());
+    }
+    library(&db, &home, json!({"op":"source-ignore","path":"repo","cwd":home}));
+    library(&db, &home, json!({"op":"source-ignore","path":"~/gone"}));
+    let rules = library(&db, &home, json!({"op":"source-ignore","path":sub.join(".")}));
+    assert_eq!(ignored(&rules), [path(&gone), path(&repo), path(&sub)]);
+
+    let snap = snapshot(&db, &home);
+    assert_eq!(ignored(&snap), ignored(&rules));
+    assert!(uids(&snap["pinned"]).is_empty());
+    assert_eq!(uids(&snap["recent"]), ["omp:mixed", "omp:sibling"]);
+    // Explicit chats keep an all-ignored project visible; an empty one hides.
+    assert_eq!(uids(&project(&snap, "1")["sessions"]), ["omp:mixed"]);
+    assert_eq!(project(&snap, "1")["count"], 1);
+    assert_eq!(project(&snap, "2")["count"], 0);
+    assert!(snap["projects"].as_array().unwrap().iter().all(|p| p["id"] != "3"));
+    let discovered = library(&db, &home, json!({"op":"snapshot","view":"discovered","per":25,"recent":15}));
+    let roots: Vec<_> = discovered["projects"].as_array().unwrap().iter().map(|g| g["root"].as_str().unwrap()).collect();
+    assert_eq!(roots, [path(&mixed), path(&sibling)]);
+    for text in ["", "needle"] {
+        let first = run(&db, &home, &["query", "--q", text, "--limit", "1"]);
+        let rest = run(&db, &home, &["query", "--q", text, "--limit", "1", "--offset", "1"]);
+        assert_eq!((first["total"].clone(), rest["total"].clone()), (json!(2), json!(2)));
+        assert_eq!(uids(&first["sessions"]), ["omp:mixed"]);
+        assert_eq!(uids(&rest["sessions"]), ["omp:sibling"]);
+    }
+    assert_eq!(run(&db, &home, &["query", "--project-id", "1", "--q", "needle"])["total"], 1);
+    let archived = library(&db, &home, json!({"op":"archived","limit":50,"offset":0}));
+    assert_eq!(archived["total"], 0);
+    // Saving a hidden project still returns it.
+    let saved = library(&db, &home, json!({"op":"project-save","id":"3","name":"Gone","icon":"code","folders":[gone]}));
+    assert_eq!(saved["project"]["id"], "3");
+    assert_eq!(saved["project"]["hidden"], true);
+
+    // Removing one rule leaves an overlapping descendant rule in force.
+    let rules = library(&db, &home, json!({"op":"source-unignore","path":path(&repo)}));
+    assert_eq!(ignored(&rules), [path(&gone), path(&sub)]);
+    let snap = snapshot(&db, &home);
+    assert_eq!(uids(&project(&snap, "1")["sessions"]), ["omp:mixed", "omp:root"]);
+    assert!(uids(&snap["pinned"]).is_empty());
+    assert_eq!(uids(&library(&db, &home, json!({"op":"archived","limit":50,"offset":0}))["sessions"]), ["omp:wt"]);
+    // Future chats and index rebuilds keep the rules.
+    std::fs::create_dir_all(sub.join("new")).unwrap();
+    seed(&home, "later", &sub.join("new"), 700);
+    run(&db, &home, &["index"]);
+    assert_eq!(total(&db, &home), 3);
+    std::fs::remove_file(&db).unwrap();
+    run(&db, &home, &["index"]);
+    assert_eq!(ignored(&library(&db, &home, json!({"op":"source-ignores"}))), [path(&gone), path(&sub)]);
+    assert_eq!(total(&db, &home), 3);
+
+    assert!(fails(&db, &home, json!({"op":"source-unignore","path":path(&repo)})).contains("no longer exists"));
+    for rule in [&gone, &sub] {
+        library(&db, &home, json!({"op":"source-unignore","path":path(rule)}));
+    }
+    let after = snapshot(&db, &home);
+    assert_eq!(after["ignored_sources"], json!([]));
+    assert_eq!(total(&db, &home), 6);
+    assert_eq!(after["pinned"], before["pinned"]);
+    assert_eq!(project(&after, "2")["sessions"], project(&before, "2")["sessions"]);
+    assert_eq!(project(&after, "3")["sessions"], project(&before, "3")["sessions"]);
+    assert_eq!(conn.query_row("SELECT count(*) FROM project_chats", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    // Folder edits while hidden must retain automatic memberships underneath
+    // the visibility filter, including chats indexed after the rule was added.
+    library(&db, &home, json!({"op":"source-ignore","path":repo}));
+    library(&db, &home, json!({"op":"project-save","id":"1","name":"Repo","icon":"code","folders":[sibling]}));
+    library(&db, &home, json!({"op":"source-unignore","path":path(&repo)}));
+    assert_eq!(uids(&project(&snapshot(&db, &home), "1")["sessions"]),
+        ["omp:later", "omp:mixed", "omp:sibling", "omp:sub", "omp:root"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn source_ignore_through_removed_alias_keeps_hiding_both_forms() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db = temp.path().join("index.sqlite");
+    let app = home.join("app");
+    let other = home.join("other");
+    for folder in [&app, &other] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    let alias = temp.path().join("alias");
+    std::os::unix::fs::symlink(&home, &alias).unwrap();
+    seed(&home, "real", &app, 100);
+    seed(&home, "via-alias", &alias.join("app"), 200);
+    seed(&home, "other", &other, 300);
+    run(&db, &home, &["index"]);
+    let rule = alias.join("app").to_str().unwrap().to_owned();
+    library(&db, &home, json!({"op":"source-ignore","path":rule}));
+    std::fs::remove_file(&alias).unwrap();
+    let result = run(&db, &home, &["query", "--q", "needle"]);
+    assert_eq!(uids(&result["sessions"]), ["omp:other"]);
+    assert_eq!(result["total"], 1);
+    // The exact listed path removes the rule after its alias is gone.
+    assert_eq!(ignored(&library(&db, &home, json!({"op":"source-ignores"}))), [rule.as_str()]);
+    library(&db, &home, json!({"op":"source-unignore","path":rule}));
+    assert_eq!(total(&db, &home), 3);
+}
+
+fn scoped_recents(db: &Path, home: &Path, cwd: Option<&Path>) -> Vec<String> {
+    let mut request = json!({"op":"snapshot","view":"mine","per":25,"recent":15});
+    if let Some(cwd) = cwd {
+        request["recent_cwd"] = json!(cwd);
+    }
+    library(db, home, request)["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["uid"].as_str().unwrap().to_owned())
+        .collect()
+}
+
 #[test]
 fn recents_scope_to_the_panel_folder_like_worktree_search() {
     let temp = tempfile::tempdir().unwrap();
@@ -567,26 +757,14 @@ fn recents_scope_to_the_panel_folder_like_worktree_search() {
         seed(&home, &format!("other{i}"), &other, 300 + i);
     }
     run(&db, &home, &["index"]);
-    let recents = |cwd: Option<&Path>| -> Vec<String> {
-        let mut request = json!({"op":"snapshot","view":"mine","per":25,"recent":15});
-        if let Some(cwd) = cwd {
-            request["recent_cwd"] = json!(cwd);
-        }
-        library(&db, &home, request)["recent"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|s| s["uid"].as_str().unwrap().to_owned())
-            .collect()
-    };
     // Absent `recent_cwd` keeps the global newest-first list, capped at 15.
-    let all = recents(None);
+    let all = scoped_recents(&db, &home, None);
     assert_eq!(all.len(), 15);
     assert_eq!(all.first().map(String::as_str), Some("omp:other2"));
     assert!(all.iter().any(|uid| uid == "omp:other0"));
     // This folder keeps the 15 newest chats under the repository worktree, including
     // chats started in its subfolders, exactly as Search's Worktree scope does.
-    let scoped = recents(Some(&sub));
+    let scoped = scoped_recents(&db, &home, Some(&sub));
     assert_eq!(scoped.len(), 15);
     assert!(scoped
         .iter()
@@ -609,16 +787,75 @@ fn recents_scope_to_the_panel_folder_like_worktree_search() {
     );
     assert_eq!(scoped, uids(&search["sessions"]));
     assert_eq!(
-        recents(Some(&other)),
+        scoped_recents(&db, &home, Some(&other)),
         ["omp:other2", "omp:other1", "omp:other0"]
     );
-    assert!(recents(Some(&empty)).is_empty());
+    assert!(scoped_recents(&db, &home, Some(&empty)).is_empty());
     // Archived chats stay out of both scopes, and the global list still hides them.
     library(
         &db,
         &home,
         json!({"op":"chat-update","uid":"omp:sub9","archived":true}),
     );
-    assert_eq!(recents(Some(&sub)).first().map(String::as_str), Some("omp:sub8"));
-    assert!(!recents(None).iter().any(|uid| uid == "omp:sub9"));
+    assert_eq!(
+        scoped_recents(&db, &home, Some(&sub)).first().map(String::as_str),
+        Some("omp:sub8")
+    );
+    assert!(!scoped_recents(&db, &home, None)
+        .iter()
+        .any(|uid| uid == "omp:sub9"));
+}
+
+#[test]
+fn scoped_recents_hide_ignored_sources_before_the_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db = temp.path().join("index.sqlite");
+    let repo = home.join("repo");
+    let sub = repo.join("sub");
+    let other = home.join("other");
+    for folder in [&sub, &other, &repo.join(".git")] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    for i in 0..20 {
+        seed(&home, &format!("sub{i}"), &sub, 200 + i);
+    }
+    for i in 0..3 {
+        seed(&home, &format!("root{i}"), &repo, 100 + i);
+        seed(&home, &format!("other{i}"), &other, 300 + i);
+    }
+    run(&db, &home, &["index"]);
+    assert_eq!(scoped_recents(&db, &home, Some(&sub)).len(), 15);
+    library(
+        &db,
+        &home,
+        json!({"op":"source-ignore","path":sub.to_str().unwrap()}),
+    );
+    // The 20 newest chats in the worktree are ignored, so the cap must count what is
+    // left instead of truncating first and then hiding every row.
+    let scoped = scoped_recents(&db, &home, Some(&sub));
+    assert_eq!(scoped, ["omp:root2", "omp:root1", "omp:root0"]);
+    let search = run(
+        &db,
+        &home,
+        &[
+            "query",
+            "--scope",
+            "workspace",
+            "--cwd",
+            sub.to_str().unwrap(),
+            "--limit",
+            "15",
+            "--q",
+            "",
+        ],
+    );
+    assert_eq!(search["total"], 3);
+    assert_eq!(scoped, uids(&search["sessions"]));
+    // The global list hides them too, and it also fills its cap after filtering.
+    let all = scoped_recents(&db, &home, None);
+    assert_eq!(all.len(), 6);
+    assert!(all.iter().all(|uid| !uid.starts_with("omp:sub")));
+    assert_eq!(all.first().map(String::as_str), Some("omp:other2"));
 }

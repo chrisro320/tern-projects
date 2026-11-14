@@ -125,20 +125,30 @@ local function toggle(cx: SessionContext, mode: string)
 	prev_focus[new_pane] = f :: number
 	follow.track(fi)
 
-	-- After the block reports its width, resize the split.
-	tern.timer(400, function(cx2: SessionContext)
-		local ok, data = pcall(tern.fs.read, tern.plugin.data .. "/panel-cols")
-		if not ok then
+	-- The block writes its real width on every resize. Narrow a wide new sidebar once that width is in, then
+	-- correct the few cells a divider move can miss, from the width it reports next.
+	local path = tern.plugin.data .. "/panel-cols"
+	local tries, moves = 0, 0
+	local function narrow(cx2: SessionContext)
+		local ok, data = pcall(tern.fs.read, path)
+		local c = if ok then tonumber(data) else nil
+		if c == nil then
+			tries += 1
+			if tries < 20 then tern.timer(100, narrow) end
 			return
 		end
-		local c = tonumber(data)
 		-- Only a side panel is narrowed, from the edge that faces its neighbor. Read where it actually
 		-- landed: the fallback above cannot choose a side.
 		local placed = panel_side(cx2, tab :: number, new_pane :: number)
-		if c ~= nil and c > WIDTH + 2 and (placed == "left" or placed == "right") then
-			cx2.layout:resize(new_pane :: number, if placed == "left" then "right" else "left", -(c - WIDTH))
+		if placed ~= "left" and placed ~= "right" then return end
+		if c == WIDTH or moves >= 3 or (moves == 0 and c <= WIDTH + 2) then return end
+		pcall(tern.fs.remove, path)
+		moves += 1; tries = 0
+		if cx2.layout:resize(new_pane :: number, if placed == "left" then "right" else "left", WIDTH - c) then
+			tern.timer(100, narrow)
 		end
-	end)
+	end
+	tern.timer(100, narrow)
 end
 
 -- User overrides take precedence over plugin defaults. Migrate only exact old actions.

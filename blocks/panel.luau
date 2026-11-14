@@ -2097,7 +2097,6 @@ local panel: BlockDef<any> = {
 			if saved.sort == "updated" or saved.sort == "relevance" then s.sort = saved.sort end
 			if type(saved.query) == "string" then tf.set(s.query, saved.query) end
 		end
-		pcall(tern.fs.write, tern.plugin.data .. "/panel-cols", tostring(cx.cols))
 		s.update_snapshot = updates.get()
 		s.update_unsubscribe = updates.subscribe(function()
 			if not live(s) then return end
@@ -2125,8 +2124,12 @@ local panel: BlockDef<any> = {
 		return s
 	end,
 	save = function(s) return {mode = s.mode, view = s.view, query = s.query.text, scope = s.scope, sort = s.sort, recents = s.recent_filter, ctx_cwd = s.ctx_cwd} end,
-	-- Width-dependent layout (row previews, icon-only controls) must follow pane resizes.
-	resize = function(s, cols, _rows, _cx) s.cols = cols end,
+	-- Width-dependent layout (row previews, icon-only controls) must follow pane resizes. window.luau sizes a new
+	-- sidebar from the reported widths; `cx.cols` before the first report is only a placeholder.
+	resize = function(s, cols, _rows, _cx)
+		pcall(tern.fs.write, tern.plugin.data .. "/panel-cols", tostring(cols))
+		s.cols = cols
+	end,
 	title = function(s) return if s.mode == "projects" then "Projects" elseif s.mode == "search" then "Projects · Search" elseif s.mode == "workspaces" then "Projects · Workspaces" else "Projects · Settings" end,
 	view = function(s, cx)
 		-- `cx.cols` is a placeholder until the pane reports a resize; only trust reported widths.

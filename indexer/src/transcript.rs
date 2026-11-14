@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -73,12 +73,38 @@ fn cut_to_tail(s: &str, cap: usize) -> String {
     out
 }
 
-/// Close a code fence left open, so one message cannot swallow the rest of the preview.
+/// The marker and reopened fence a cut reply needs before its retained text.
+fn markdown_head(cut: bool, fence: Option<(char, usize)>) -> String {
+    let mut head = String::new();
+    if cut {
+        head.push_str(CUT);
+        head.push_str("\n\n");
+    }
+    if let Some((marker, width)) = fence {
+        head.push_str(&fence_line(marker, width));
+        head.push('\n');
+    }
+    head
+}
+
+/// The first line start at or after `at`, moved to a character boundary.
+fn line_start(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while at < text.len() && !text.is_char_boundary(at) {
+        at += 1;
+    }
+    match text[at..].find('\n') {
+        Some(index) => at + index + 1,
+        None => text.len(),
+    }
+}
+
+/// The fence left open after reading `text`, continuing from `open`.
 ///
 /// A closing fence matches the opening character and is at least as long as its opening run, so
-/// ```` ```` ```` never closes a ```` ``` ```` fence that opened with four.
-fn close_fences(text: &mut String) {
-    let mut open: Option<(char, usize)> = None;
+/// ```` ``` ```` never closes a ```` ```` ```` fence that opened with four.
+fn fence_after(open: Option<(char, usize)>, text: &str) -> Option<(char, usize)> {
+    let mut open = open;
     for line in text.lines() {
         let line = line.trim_start();
         let Some(marker) = line.chars().next().filter(|c| *c == '`' || *c == '~') else {
@@ -100,9 +126,19 @@ fn close_fences(text: &mut String) {
             _ => {}
         }
     }
-    if let Some((marker, width)) = open {
+    open
+}
+
+/// A fence line that opens a block of the given character and width.
+fn fence_line(marker: char, width: usize) -> String {
+    std::iter::repeat_n(marker, width).collect()
+}
+
+/// Close a code fence left open, so one message cannot swallow the rest of the preview.
+fn close_fences(text: &mut String) {
+    if let Some((marker, width)) = fence_after(None, text) {
         text.push('\n');
-        text.extend(std::iter::repeat_n(marker, width));
+        text.push_str(&fence_line(marker, width));
     }
 }
 
@@ -182,6 +218,13 @@ enum Block {
     Tools(Tools),
 }
 
+fn block_text(block: &Block) -> String {
+    match block {
+        Block::Text(text) => text.clone(),
+        Block::Tools(tools) => tools.line(),
+    }
+}
+
 fn block_len(block: &Block) -> usize {
     match block {
         Block::Text(text) => text.len(),
@@ -195,17 +238,20 @@ struct Turn {
     blocks: VecDeque<Block>,
     used: usize,
     cut: bool,
+    /// The fence open where the retained blocks begin, so a cut reply stays inside its code block.
+    fence: Option<(char, usize)>,
 }
 
 impl Turn {
     fn new(role: Role) -> Self {
-        Self { role, blocks: VecDeque::new(), used: 0, cut: false }
+        Self { role, blocks: VecDeque::new(), used: 0, cut: false, fence: None }
     }
 
     fn trim(&mut self) {
         while self.blocks.len() > 1 && (self.used > TURN_BUFFER || self.blocks.len() > MAX_BLOCKS) {
             let Some(block) = self.blocks.pop_front() else { break };
             self.used = self.used.saturating_sub(block_len(&block) + 2);
+            self.fence = fence_after(self.fence, &block_text(&block));
             self.cut = true;
         }
     }
@@ -234,23 +280,32 @@ impl Turn {
     }
 
     /// Markdown for this turn, never longer than [`TURN_CAP`].
+    ///
+    /// A cut reply keeps its end; when that end starts inside a fenced block whose opening was
+    /// dropped, a matching fence is put back so the surviving closing fence still closes it.
     fn markdown(&self) -> String {
-        let parts: Vec<String> = self
-            .blocks
-            .iter()
-            .map(|block| match block {
-                Block::Text(text) => text.clone(),
-                Block::Tools(tools) => tools.line(),
-            })
-            .collect();
-        let mut out = parts.join("\n\n");
-        if self.cut {
-            out = format!("{CUT}\n\n{out}");
+        let joined = self.blocks.iter().map(block_text).collect::<Vec<String>>().join("\n\n");
+        let mut cut = self.cut;
+        let mut start = 0;
+        let mut fence = self.fence;
+        for _ in 0..3 {
+            let head = markdown_head(cut, fence);
+            let budget = TURN_CAP.saturating_sub(head.len());
+            if joined.len() - start <= budget {
+                return format!("{head}{}", &joined[start..]);
+            }
+            cut = true;
+            let at = line_start(&joined, joined.len() - budget);
+            if at <= start {
+                break;
+            }
+            fence = fence_after(self.fence, &joined[..at]);
+            start = at;
         }
-        if out.len() > TURN_CAP {
-            out = cut_to_tail(&out, TURN_CAP);
-        }
-        out
+        // Pathological fences keep changing the head: keep the last measured tail.
+        let head = markdown_head(cut, fence);
+        let at = line_start(&joined, joined.len().saturating_sub(TURN_CAP.saturating_sub(head.len())));
+        format!("{head}{}", &joined[at.min(joined.len())..])
     }
 }
 
@@ -403,10 +458,10 @@ impl Builder {
     }
 }
 
-/// Run `each` over the file's lines without loading it whole.
-fn each_line(path: &Path, mut each: impl FnMut(&str) -> Result<()>) -> Result<()> {
+/// Run `each` over the file's lines without loading it whole, reading at most `limit` bytes.
+fn each_line(path: &Path, limit: u64, mut each: impl FnMut(&str) -> Result<()>) -> Result<()> {
     let file = File::open(path).with_context(|| format!("Reading {}", path.display()))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(file.take(limit));
     let mut line = String::new();
     loop {
         line.clear();
@@ -415,6 +470,31 @@ fn each_line(path: &Path, mut each: impl FnMut(&str) -> Result<()>) -> Result<()
         }
         each(line.trim_end_matches(['\n', '\r']))?;
     }
+}
+
+/// The file's length and modification time, used to pin one consistent snapshot of a session.
+fn file_stamp(path: &Path) -> Result<(u64, Option<std::time::SystemTime>)> {
+    let meta = std::fs::metadata(path).with_context(|| format!("Reading {}", path.display()))?;
+    Ok((meta.len(), meta.modified().ok()))
+}
+
+/// Run `read` against one snapshot of `path`, retrying both passes once if the file is rewritten.
+///
+/// A longer file is an append to the same prefix, so it stays readable; a shorter file or a
+/// rewrite at the same length would mix two versions and is retried, then refused.
+fn stable_snapshot<T>(path: &Path, mut read: impl FnMut(u64) -> Result<T>) -> Result<T> {
+    for attempt in 0..2 {
+        let (len, modified) = file_stamp(path)?;
+        let value = read(len)?;
+        let (now_len, now_modified) = file_stamp(path)?;
+        if now_len > len || (now_len == len && now_modified == modified) {
+            return Ok(value);
+        }
+        if attempt == 1 {
+            bail!("This chat changed while loading. Try again.");
+        }
+    }
+    unreachable!("the retry above either returns or fails")
 }
 
 /// The entries from the file's last entry back to the root.
@@ -431,19 +511,34 @@ fn active_branch(parents: &HashMap<String, Option<String>>, tip: &str) -> HashSe
 }
 
 /// OMP sessions are trees: `/tree` and rewinds leave abandoned entries in the file, so only the
-/// branch that ends at the last entry is the conversation. Two streaming passes keep one small
-/// id map instead of every parsed entry.
+/// branch that ends at the last chat message is the conversation. Two streaming passes over one
+/// snapshot keep one small id map instead of every parsed entry.
 fn read_omp(path: &Path) -> Result<Preview> {
+    stable_snapshot(path, |len| omp_snapshot(path, len))
+}
+
+/// One bounded read of an OMP session: the branch is chosen in the first pass and rendered in the
+/// second, both over the same `limit` bytes.
+fn omp_snapshot(path: &Path, limit: u64) -> Result<Preview> {
     let mut parents: HashMap<String, Option<String>> = HashMap::new();
     let mut tip: Option<String> = None;
+    let mut linked = false;
     let mut overflow = false;
-    each_line(path, |line| {
+    each_line(path, limit, |line| {
         let Ok(value) = serde_json::from_str::<Value>(line) else { return Ok(()) };
         let Some(id) = value.get("id").and_then(Value::as_str) else { return Ok(()) };
+        let is_message = value.get("type").and_then(Value::as_str) == Some("message");
         let parent = value.get("parentId");
-        // Metadata records (title changes and the session header) carry ids but not the tree;
-        // a message without `parentId` is a root, so it still counts.
-        if parent.is_none() && value.get("message").is_none() {
+        // Only chat messages name the live branch: bookkeeping records (model usage, title
+        // changes) are appended after them, and one on an older branch must not become the tip.
+        if is_message {
+            linked = linked || parent.is_some();
+            if parent.is_some() || tip.is_none() {
+                tip = Some(id.to_owned());
+            }
+        }
+        // Metadata records (the session header, title changes) carry ids but not the tree.
+        if parent.is_none() && !is_message {
             return Ok(());
         }
         if parents.len() >= MAX_TREE_ENTRIES {
@@ -451,16 +546,15 @@ fn read_omp(path: &Path) -> Result<Preview> {
             return Ok(());
         }
         parents.insert(id.to_owned(), parent.and_then(Value::as_str).map(str::to_owned));
-        tip = Some(id.to_owned());
         Ok(())
     })?;
-    // Too many entries to map: render the file as written rather than half a branch.
+    // Sessions without parent links, or too long to map, render as written rather than as one branch.
     let branch = match tip {
-        Some(tip) if !overflow => Some(active_branch(&parents, &tip)),
+        Some(tip) if linked && !overflow => Some(active_branch(&parents, &tip)),
         _ => None,
     };
     let mut out = Builder::new();
-    each_line(path, |line| {
+    each_line(path, limit, |line| {
         let Ok(value) = serde_json::from_str::<Value>(line) else { return Ok(()) };
         if let Some(branch) = &branch {
             let id = value.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -486,7 +580,7 @@ fn read_omp(path: &Path) -> Result<Preview> {
 /// are not the conversation. Queued prompts reach the agent as attachment records.
 fn read_claude(path: &Path) -> Result<Preview> {
     let mut out = Builder::new();
-    each_line(path, |line| {
+    each_line(path, u64::MAX, |line| {
         let Ok(value) = serde_json::from_str::<Value>(line) else { return Ok(()) };
         let flag = |key: &str| value.get(key).and_then(Value::as_bool).unwrap_or(false);
         // Compaction summaries are written as user records but are Claude Code's own text.
@@ -718,6 +812,101 @@ mod tests {
             (Role::User, "follow-up".to_owned()),
             (Role::Assistant, "second answer".to_owned()),
         ]);
+    }
+
+    #[test]
+    fn omp_sessions_without_parent_links_render_every_message() {
+        // The checked-in OMP fixtures carry message ids but no `parentId`.
+        let jsonl = [
+            r#"{"type":"session","id":"session-omp1","cwd":"/project","timestamp":1717236000000}"#,
+            r#"{"type":"title_change","title":"OMP indexer session","timestamp":1717236001000}"#,
+            r#"{"type":"message","id":"msg1","timestamp":1717236003000,"message":{"role":"user","content":[{"type":"text","text":"one"}]}}"#,
+            r#"{"type":"message","id":"msg2","timestamp":1717236004000,"message":{"role":"assistant","content":[{"type":"text","text":"two"}]}}"#,
+            r#"{"type":"message","id":"msg3","timestamp":1717236005000,"message":{"role":"user","content":[{"type":"text","text":"three"}]}}"#,
+        ];
+        let preview = claude_omp(&jsonl);
+        assert_eq!(rendered(&preview), vec![
+            (Role::User, "one".to_owned()),
+            (Role::Assistant, "two".to_owned()),
+            (Role::User, "three".to_owned()),
+        ]);
+    }
+
+    #[test]
+    fn omp_bookkeeping_entries_never_pick_the_branch() {
+        let jsonl = [
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"user","content":[{"type":"text","text":"root"}]}}"#,
+            r#"{"type":"message","id":"c","parentId":"a","message":{"role":"assistant","content":[{"type":"text","text":"abandoned"}]}}"#,
+            r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[{"type":"text","text":"live"}]}}"#,
+            // Bookkeeping on the older branch is written last; it is not a chat message.
+            r#"{"type":"model_usage","id":"u1","parentId":"c","tokens":42}"#,
+        ];
+        let preview = claude_omp(&jsonl);
+        assert_eq!(rendered(&preview), vec![
+            (Role::User, "root".to_owned()),
+            (Role::Assistant, "live".to_owned()),
+        ]);
+    }
+
+    #[test]
+    fn omp_snapshot_retries_a_rewritten_session_and_then_fails() {
+        let scratch = Scratch::new("rewrite");
+        let path = scratch.file("chat.jsonl", "12345");
+        let mut reads = 0;
+        let result: Result<u64> = stable_snapshot(&path, |len| {
+            reads += 1;
+            // The session is rewritten shorter while the preview loads; both passes must retry.
+            std::fs::write(&path, "1").unwrap();
+            Ok(len)
+        });
+        assert_eq!(reads, 2, "retry both passes once, then refuse");
+        assert_eq!(result.unwrap_err().to_string(), "This chat changed while loading. Try again.");
+    }
+
+    #[test]
+    fn omp_snapshot_ignores_messages_appended_while_loading() {
+        let jsonl = [
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"user","content":[{"type":"text","text":"one"}]}}"#,
+            r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[{"type":"text","text":"two"}]}}"#,
+        ];
+        let scratch = Scratch::new("append");
+        let path = scratch.file("chat.jsonl", &format!("{}\n", jsonl.join("\n")));
+        let snapshot = std::fs::metadata(&path).unwrap().len();
+        // An append after the snapshot falls outside both passes instead of only one of them.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, r#"{{"type":"message","id":"c","parentId":"b","message":{{"role":"user","content":[{{"type":"text","text":"three"}}]}}}}"#).unwrap();
+        }
+        let preview = omp_snapshot(&path, snapshot).unwrap();
+        assert_eq!(rendered(&preview), vec![
+            (Role::User, "one".to_owned()),
+            (Role::Assistant, "two".to_owned()),
+        ]);
+        // Without the snapshot bound the appended message would appear in the second pass.
+        let full = rendered(&read_omp(&path).unwrap());
+        assert_eq!(full.len(), 3, "{full:?}");
+    }
+
+    #[test]
+    fn cut_reply_restores_the_fence_it_starts_inside() {
+        let mut builder = Builder::new();
+        // The turn cap cuts through this fenced reply: its closing fence survives, its opener does not.
+        builder.say(Role::Assistant, &format!("```\n{}\n```", "c\n".repeat(7_000)));
+        for _ in 0..3 {
+            builder.say(Role::Assistant, &"p".repeat(16_000));
+        }
+        builder.say(Role::Assistant, &"q".repeat(9_342));
+        let preview = builder.finish();
+        let markdown = &preview.turns.front().expect("one turn").1;
+        assert!(
+            markdown.starts_with(&format!("{CUT}\n\n```\n")),
+            "a matching opener precedes the tail: {:?}",
+            &markdown[..markdown.len().min(80)]
+        );
+        assert!(markdown.len() <= TURN_CAP, "{}", markdown.len());
+        let fences = markdown.lines().filter(|line| line.trim_start().starts_with("```")).count();
+        assert_eq!(fences % 2, 0, "the surviving closing fence still closes");
     }
 
     #[test]

@@ -196,9 +196,12 @@ if retargeted.recent_filter ~= "folder" then action(retargeted, "recent", "folde
 scoped_recent = {{uid = "cd-1", title = "After cd"}}
 retargeted.page = recents_page
 retargeted.menu = {ids = {"refresh"}, selected = "refresh"}
+retargeted.editor = modules["project-editor"].new({name = "", folders = {}})
 follow(retargeted, "/tmp/recents/cd")
 check(retargeted.ctx_cwd == "/tmp/recents/cd", "the followed terminal's folder retargets the panel")
 check(retargeted.menu ~= nil and retargeted.mode == "projects", "following a folder keeps the open menu and the mode")
+check(retargeted.editor ~= nil, "following a folder leaves an open dialog alone")
+retargeted.editor = nil
 flush()
 check(last_snapshot().recent_cwd == "/tmp/recents/cd", "This folder follows the terminal's folder")
 check(uids(retargeted.recent) == "cd-1", "the followed folder's chats replace the old ones")

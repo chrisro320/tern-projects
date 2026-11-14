@@ -275,6 +275,7 @@ fn cleanup_cache(db_path: &Path, chat: &Chat, plan: &Plan) -> Result<Vec<String>
             tx.execute("DELETE FROM sources WHERE source=?1", [&source])?;
             tx.execute("DELETE FROM library.chat_state WHERE uid=?1", [&uid])?;
             tx.execute("DELETE FROM library.project_chats WHERE uid=?1", [&uid])?;
+            tx.execute("DELETE FROM library.project_pins WHERE uid=?1", [&uid])?;
             uids.push(uid);
         }
         let source = match chat.agent.as_str() {
@@ -289,6 +290,7 @@ fn cleanup_cache(db_path: &Path, chat: &Chat, plan: &Plan) -> Result<Vec<String>
         let uid = format!("{}:{}", chat.agent, id);
         tx.execute("DELETE FROM library.chat_state WHERE uid=?1", [&uid])?;
         tx.execute("DELETE FROM library.project_chats WHERE uid=?1", [&uid])?;
+        tx.execute("DELETE FROM library.project_pins WHERE uid=?1", [&uid])?;
         if !uids.contains(&uid) {
             uids.push(uid);
         }
@@ -305,6 +307,7 @@ fn cleanup_cache(db_path: &Path, chat: &Chat, plan: &Plan) -> Result<Vec<String>
             for uid in owned_uids {
                 tx.execute("DELETE FROM library.chat_state WHERE uid=?1", [&uid])?;
                 tx.execute("DELETE FROM library.project_chats WHERE uid=?1", [&uid])?;
+                tx.execute("DELETE FROM library.project_pins WHERE uid=?1", [&uid])?;
                 if !uids.contains(&uid) {
                     uids.push(uid);
                 }

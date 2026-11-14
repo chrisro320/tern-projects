@@ -993,7 +993,7 @@ local function menu_entries(s: any, key: string): {string}
 	local row = s.rows[key]
 	if not row then return {} end
 	if row.kind == "session" then
-		local ids = {"resume", "copy-resume-command", "copy-chat-id", "-", if row.ref.pinned then "unpin" else "pin", "move-to-project…", if row.ref.archived then "restore" else "archive", "-", if s.mode == "search" then "search-options" else "panel-options", "-", "delete-permanently…"}
+		local ids = {"resume", "copy-resume-command", "copy-chat-id", "-", if row.ref.pinned then "unpin" else "pin", if row.ref.project_pinned then "unpin-from-project" else "pin-in-project", "move-to-project…", if row.ref.archived then "restore" else "archive", "-", if s.mode == "search" then "search-options" else "panel-options", "-", "delete-permanently…"}
 		if previewable(row.ref) then table.insert(ids, 2, "preview") end
 		return ids
 	elseif row.kind == "project" then
@@ -1019,6 +1019,8 @@ local MENU_META: {[string]: any} = {
 	["copy-chat-id"] = {label = "Copy chat ID", icon = "hash"},
 	["pin"] = {label = "Pin", icon = "pin"},
 	["unpin"] = {label = "Unpin", icon = "pin"},
+	["pin-in-project"] = {label = "Pin in project", icon = "pin"},
+	["unpin-from-project"] = {label = "Unpin from project", icon = "pin"},
 	["move-to-project…"] = {label = "Move to project…", icon = "folder-go"},
 	["archive"] = {label = "Archive", icon = "inbox"},
 	["restore"] = {label = "Restore", icon = "undo"},
@@ -1396,6 +1398,9 @@ local function chat_action(s: any, act: string, chat: any)
 	elseif act == "copy-chat-id" then copy(s, chat.id or chat.uid, "chat ID")
 	elseif act == "pin" or act == "unpin" then
 		mutate(s, {op = "chat-update", uid = chat.uid, pinned = act == "pin"}, function() toast(s, "success", if act == "pin" then "Pinned" else "Unpinned") end)
+	elseif act == "pin-in-project" or act == "unpin-from-project" then
+		local on = act == "pin-in-project"
+		mutate(s, {op = "chat-update", uid = chat.uid, project_pinned = on}, function() toast(s, "success", if on then "Pinned in project" else "Unpinned from project") end)
 	elseif act == "archive" or act == "restore" then
 		mutate(s, {op = "chat-update", uid = chat.uid, archived = act == "archive"}, function()
 			if act == "archive" then toast(s, "success", "Archived", "Restore it from Settings → Archived chats.") else toast(s, "success", "Restored") end
@@ -1717,8 +1722,10 @@ local function list_view(s: any): any
 				props.icon = fmt.agent_icon(r.agent or "")
 				props.tone = fmt.agent_tone(r.agent, s.settings.icon_style)
 				props.label = r.title or r.uid
-				props.value = if r.pinned then {ui.span("\u{f08d} ", "icon"), ui.span(fmt.age(r.updated_ms or 0), "muted")} else fmt.age(r.updated_ms or 0)
-				props.title = fmt.agent_label(r.agent or "") .. " · " .. fmt.path(r.cwd or "") .. (if r.pinned then " · Pinned" else "")
+				-- A project pin leads only its project or folder card and This folder, so it is marked only there.
+				local grouped = r.project_pinned and (child or (key == "recent:" .. r.uid and s.recent_filter == "folder"))
+				props.value = if r.pinned or grouped then {ui.span("\u{f08d} ", "icon"), ui.span(fmt.age(r.updated_ms or 0), "muted")} else fmt.age(r.updated_ms or 0)
+				props.title = fmt.agent_label(r.agent or "") .. " · " .. fmt.path(r.cwd or "") .. (if r.pinned then " · Pinned" else "") .. (if grouped then " · Pinned in project" else "")
 				local snippet = s.mode == "search" and s.query.text ~= "" and type(r.snippet) == "string" and r.snippet ~= ""
 				if snippet then
 					props.detail = fmt.snippet_spans(r.snippet, r.title)

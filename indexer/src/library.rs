@@ -7,6 +7,11 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
+/// Fork-only: chats pinned inside their project or folder. A table of its own leaves the
+/// library at upstream's schema version, so upstream builds still open it and ignore pins.
+const PROJECT_PINS: &str =
+    "CREATE TABLE IF NOT EXISTS project_pins(uid TEXT PRIMARY KEY,pinned_ms INTEGER NOT NULL);";
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Request {
@@ -34,6 +39,8 @@ pub enum Request {
         pinned: Option<bool>,
         archived: Option<bool>,
         assignment: Option<Assignment>,
+        /// Pins the chat inside its project or folder, never in the global Pinned list.
+        project_pinned: Option<bool>,
     },
     Archived {
         limit: i64,
@@ -158,6 +165,7 @@ impl Library {
                     "unsupported library schema version {version}; library was not overwritten"
                 );
             }
+            tx.execute_batch(PROJECT_PINS)?;
             if version < 2 {
                 validate_library(&tx)?;
                 tx.execute_batch(
@@ -185,7 +193,20 @@ impl Library {
                 version == 3,
                 "unsupported library schema version {version}; library was not overwritten"
             );
-            validate_library(&conn)?;
+            let pins: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='project_pins'",
+                [],
+                |r| r.get(0),
+            )?;
+            if pins == 0 {
+                // A library that fails validation is left exactly as it was.
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute_batch(PROJECT_PINS)?;
+                validate_library(&tx)?;
+                tx.commit()?;
+            } else {
+                validate_library(&conn)?;
+            }
         }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let lib = Self { conn };
@@ -388,6 +409,7 @@ impl Library {
         pinned: Option<bool>,
         archived: Option<bool>,
         assignment: Option<Assignment>,
+        project_pinned: Option<bool>,
     ) -> Result<Value> {
         anyhow::ensure!(!uid.is_empty(), "missing chat UID");
         let assigned = match &assignment {
@@ -423,6 +445,15 @@ impl Library {
                 "UPDATE chat_state SET assignment=?,project_id=? WHERE uid=?",
                 params![a.mode, assigned, uid],
             )?;
+        }
+        match project_pinned {
+            Some(true) => {
+                tx.execute("INSERT OR IGNORE INTO project_pins(uid,pinned_ms) VALUES(?,?)", params![uid, now_ms()])?;
+            }
+            Some(false) => {
+                tx.execute("DELETE FROM project_pins WHERE uid=?", [uid])?;
+            }
+            None => {}
         }
         tx.commit()?;
         Ok(json!({"ok":true}))
@@ -534,6 +565,7 @@ fn validate_schema(conn: &Connection) -> Result<()> {
         ("settings", &[("key", "TEXT", 1), ("value", "TEXT", 0)]),
         ("project_chats", &[("project_id", "INTEGER", 1), ("uid", "TEXT", 2)]),
         ("ignored_sources", &[("path", "TEXT", 1), ("resolved", "TEXT", 0)]),
+        ("project_pins", &[("uid", "TEXT", 1), ("pinned_ms", "INTEGER", 0)]),
     ];
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     for (table, expected) in tables {

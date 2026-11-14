@@ -76,6 +76,10 @@ pub struct SessionJson {
     pub pinned: bool,
     pub archived: bool,
     pub assignment: Assignment,
+    pub project_pinned: bool,
+    /// When it was pinned in its project or folder; orders those pins, newest first.
+    #[serde(skip)]
+    pub project_pinned_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Serialize)]

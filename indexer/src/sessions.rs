@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 const COLUMNS:&str = "s.uid,s.agent,s.id,s.title,s.cwd,s.project_root,s.worktree_root,s.branch,s.model,s.created_ms,s.updated_ms,s.messages,s.last_assistant,s.resume";
-const JOIN: &str = " LEFT JOIN library.chat_state cs ON cs.uid=s.uid ";
+const JOIN: &str = " LEFT JOIN library.chat_state cs ON cs.uid=s.uid LEFT JOIN library.project_pins pp ON pp.uid=s.uid ";
 // Ignored source folders hide chats everywhere, before counts and paging.
 const SHOWN: &str = "s.uid NOT IN (SELECT uid FROM temp.ignored_uids)";
 const VISIBLE: &str =
@@ -54,6 +54,7 @@ fn rows(conn: &Connection, sql: &str, values: &[SqlValue], home: &str) -> Result
             let root: String = r.get(5)?;
             let assigned: Option<i64> = r.get(18)?;
             let raw: String = r.get(13)?;
+            let project_pinned_ms: Option<i64> = r.get(19)?;
             let resume = serde_json::from_str(&raw).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     13,
@@ -84,13 +85,21 @@ fn rows(conn: &Connection, sql: &str, values: &[SqlValue], home: &str) -> Result
                     mode: r.get(17)?,
                     project_id: assigned.map(|i| i.to_string()),
                 },
+                project_pinned: project_pinned_ms.is_some(),
+                project_pinned_ms,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 fn select(snippet: &str) -> String {
-    format!("SELECT {COLUMNS},{snippet},cs.pinned_ms,cs.archived_ms,COALESCE(cs.assignment,'automatic'),cs.project_id FROM sessions s")
+    format!("SELECT {COLUMNS},{snippet},cs.pinned_ms,cs.archived_ms,COALESCE(cs.assignment,'automatic'),cs.project_id,pp.pinned_ms FROM sessions s")
+}
+/// Chats pinned in their project or folder lead it, newest pin first; the rest keep their order.
+fn pins_first<'a>(chats: impl Iterator<Item = &'a SessionJson>) -> Vec<&'a SessionJson> {
+    let mut chats: Vec<_> = chats.collect();
+    chats.sort_by_key(|s| std::cmp::Reverse(s.project_pinned_ms));
+    chats
 }
 fn page(limit: i64, offset: i64) -> Result<()> {
     anyhow::ensure!(
@@ -245,14 +254,16 @@ fn projection(
     );
     let (conn, lib) = open(db_path)?;
     let sessions = visible(&conn, home)?;
-    // `recent_cwd` keeps only chats started where Search's Worktree scope would find them.
-    // Ignored sources are already absent from `sessions`, so they stay hidden here too.
+    // `recent_cwd` keeps only chats started where Search's Worktree scope would find them, with
+    // chats pinned in that folder first. Ignored sources are already absent from `sessions`.
     let recent_root = recent_cwd.map(|cwd| scope_root("workspace", cwd, home).1);
-    let recents: Vec<_> = sessions
-        .iter()
-        .filter(|s| recent_root.as_deref().is_none_or(|root| s.worktree_root == root))
-        .take(recent as usize)
-        .collect();
+    let recents: Vec<_> = match recent_root.as_deref() {
+        Some(root) => pins_first(sessions.iter().filter(|s| s.worktree_root == root)),
+        None => sessions.iter().collect(),
+    }
+    .into_iter()
+    .take(recent as usize)
+    .collect();
     let pinned = rows(
         &conn,
         &format!(
@@ -289,7 +300,7 @@ fn projection(
                 continue;
             }
             let updated = matching.first().map(|s| s.updated_ms).unwrap_or(0);
-            result.push((!matching.is_empty(),updated,p.created_ms,p.id.parse::<i64>()?,json!({"id":p.id,"name":p.name,"icon":p.icon,"folders":p.folders,"hidden":hidden,"count":matching.len(),"updated_ms":updated,"sessions":matching.iter().take(per as usize).collect::<Vec<_>>()})));
+            result.push((!matching.is_empty(),updated,p.created_ms,p.id.parse::<i64>()?,json!({"id":p.id,"name":p.name,"icon":p.icon,"folders":p.folders,"hidden":hidden,"count":matching.len(),"updated_ms":updated,"sessions":pins_first(matching.iter().copied()).into_iter().take(per as usize).collect::<Vec<_>>()})));
         }
         result.sort_by(|a, b| {
             b.0.cmp(&a.0)
@@ -300,20 +311,17 @@ fn projection(
         result.into_iter().map(|r| r.4).collect::<Vec<_>>()
     } else {
         let mut groups: Vec<Value> = Vec::new();
+        let mut members: Vec<Vec<&SessionJson>> = Vec::new();
         let mut positions = std::collections::HashMap::new();
         for s in &sessions {
             let pos=*positions.entry(s.project_root.as_str()).or_insert_with(|| {
-                let pos=groups.len(); groups.push(json!({"root":s.project_root,"label":s.project_label,"count":0,"updated_ms":s.updated_ms,"sessions":[]})); pos
+                let pos=groups.len(); groups.push(json!({"root":s.project_root,"label":s.project_label,"updated_ms":s.updated_ms})); members.push(Vec::new()); pos
             });
-            let g = &mut groups[pos];
-            let count = g["count"].as_i64().context("invalid group count")?;
-            g["count"] = json!(count + 1);
-            if count < per {
-                g["sessions"]
-                    .as_array_mut()
-                    .context("invalid group sessions")?
-                    .push(serde_json::to_value(s)?);
-            }
+            members[pos].push(s);
+        }
+        for (g, chats) in groups.iter_mut().zip(members) {
+            g["count"] = json!(chats.len());
+            g["sessions"] = serde_json::to_value(pins_first(chats.into_iter()).into_iter().take(per as usize).collect::<Vec<_>>())?;
         }
         groups
     };

@@ -312,8 +312,8 @@ fn run_library(db_path: &Path, home: &Path) -> Result<serde_json::Value> {
             sessions::saved_project(db_path, &home_str, saved["project"]["id"].as_str().context("missing saved project ID")?)
         }
         Request::ProjectRemove { id } => library::Library::open(db_path)?.remove_project(&id),
-        Request::ChatUpdate { uid, pinned, archived, assignment } => {
-            library::Library::open(db_path)?.update_chat(&uid, pinned, archived, assignment)
+        Request::ChatUpdate { uid, pinned, archived, assignment, project_pinned } => {
+            library::Library::open(db_path)?.update_chat(&uid, pinned, archived, assignment, project_pinned)
         }
         Request::Archived { limit, offset } => sessions::archived(db_path, &home_str, limit, offset),
         Request::SettingsUpdate { default_harness, icon_style } => {

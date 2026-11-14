@@ -517,6 +517,16 @@ fn malformed_legacy_library_is_not_migrated_or_overwritten() {
     assert_eq!(conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE name='project_chats'", [],
         |r| r.get::<_, i64>(0)).unwrap(), 0);
+    // A current-version library that fails validation does not gain the fork's pin table either.
+    let current = temp.path().join("current");
+    std::fs::create_dir_all(&current).unwrap();
+    let conn = rusqlite::Connection::open(current.join("library.sqlite")).unwrap();
+    conn.execute_batch("CREATE TABLE projects(id INTEGER PRIMARY KEY,name TEXT); PRAGMA user_version=3;").unwrap();
+    assert!(fails(&current.join("index.sqlite"), &home, json!({"op":"snapshot","view":"mine","per":25,"recent":15}))
+        .contains("malformed library schema"));
+    assert_eq!(conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name='project_pins'", [],
+        |r| r.get::<_, i64>(0)).unwrap(), 0);
 }
 
 #[test]
@@ -858,4 +868,54 @@ fn scoped_recents_hide_ignored_sources_before_the_cap() {
     assert_eq!(all.len(), 6);
     assert!(all.iter().all(|uid| !uid.starts_with("omp:sub")));
     assert_eq!(all.first().map(String::as_str), Some("omp:other2"));
+}
+
+#[test]
+fn project_pins_lead_their_project_folder_and_this_folder_but_never_pinned() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db = temp.path().join("index.sqlite");
+    let app = home.join("app");
+    let other = home.join("other");
+    for folder in [&app, &other] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    for i in 0..30 {
+        seed(&home, &format!("app{i}"), &app, 100 + i);
+    }
+    seed(&home, "other0", &other, 500);
+    run(&db, &home, &["index"]);
+    let id = create(&db, &home, "App", json!([app]));
+    let pin = |uid: &str, on: bool| {
+        library(&db, &home, json!({"op":"chat-update","uid":uid,"project_pinned":on}));
+    };
+    // The two oldest chats fall outside the 25 a card returns and the 15 Recents hold.
+    pin("omp:app0", true);
+    pin("omp:app1", true);
+    let expected = ["omp:app1", "omp:app0", "omp:app29"];
+    let mine = library(&db, &home, json!({"op":"snapshot","view":"mine","per":25,"recent":15}));
+    let card = project(&mine, &id);
+    assert_eq!(uids(&card["sessions"])[..3], expected, "the newest pin leads the project");
+    assert_eq!(card["sessions"].as_array().unwrap().len(), 25);
+    assert_eq!(card["sessions"][0]["project_pinned"], true);
+    assert_eq!(card["updated_ms"], card["sessions"][2]["updated_ms"], "the card still sorts by its newest chat");
+    assert!(mine["pinned"].as_array().unwrap().is_empty(), "project pins stay out of the global Pinned list");
+    let discovered =
+        library(&db, &home, json!({"op":"snapshot","view":"discovered","per":25,"recent":15}));
+    let groups = discovered["projects"].as_array().unwrap();
+    assert_eq!(groups[0]["root"], other.to_str().unwrap(), "folders keep their recency order");
+    let folder = groups.iter().find(|g| g["root"] == app.to_str().unwrap()).unwrap();
+    assert_eq!(folder["count"], 30);
+    assert_eq!(uids(&folder["sessions"])[..3], expected, "the newest pin leads the folder");
+    assert_eq!(scoped_recents(&db, &home, Some(&app))[..3], expected, "pins lead This folder");
+    let all = scoped_recents(&db, &home, None);
+    assert_eq!(all[0], "omp:other0", "All keeps plain recency");
+    assert!(!all.iter().any(|uid| uid == "omp:app0"));
+    pin("omp:app1", false);
+    pin("omp:app0", false);
+    assert_eq!(scoped_recents(&db, &home, Some(&app))[0], "omp:app29", "unpinning restores recency");
+    // Upstream builds open only libraries at their own schema version.
+    let conn = rusqlite::Connection::open(temp.path().join("library.sqlite")).unwrap();
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, 3);
 }

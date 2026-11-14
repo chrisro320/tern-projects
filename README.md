@@ -61,7 +61,7 @@ If you use multiple AI coding agents, your sessions are scattered across hidden 
 - 🎯 **Primary Launch Directories** — Pick one folder as **Primary** (where fresh agent sessions spawn), while additional directories are automatically supplied via `--add-dir` to harnesses that support multi-folder workspaces (OMP, Claude Code, Codex).
 - 🔍 **Instant Full-Text Search** — FTS5-powered search across all your past sessions. Filter by **Worktree**, **Repository**, or **All history** with live keyword highlighting.
 - 🚀 **Fresh Chat Launching** — Press `⌘N` (`Ctrl+N`) to launch a new chat in your preferred CLI (`omp`, `claude`, `codex`, `pi`, `opencode`, or `cursor`).
-- 📌 **Global Pins & Recents** — Keep critical threads pinned to the top of your sidebar. Recents keeps your 15 most recent chats one click away.
+- 📌 **Global Pins & Recents** — Keep critical threads pinned to the top of your sidebar. Recents keeps your 15 most recent chats one click away; by default it shows **This folder** — chats started in the panel's folder (the same matching as Search's Worktree scope) — and **All** switches to every folder. The choice is remembered.
 - 👁️ **Read-only Chat Preview** — Select an OMP or Claude Code chat and choose **Preview** (or press `Space` in Projects) to read it in a drawer inside the panel without starting the agent: your messages on the right, the agent's on the left, tool calls condensed to one line, the newest part of long chats. The drawer follows your selection; `Esc`, `Space` or its close button closes it.
 - 🗄️ **Local Archiving & Safe Deletion** — Archive threads to hide them without losing data, or permanently delete sessions via verified native CLI calls.
 

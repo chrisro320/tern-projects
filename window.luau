@@ -14,7 +14,7 @@ local follow = require("./lib/follow-cwd")
 follow.start()
 
 local KIND = "tern-projects.panel"
-local WIDTH = 44
+local WIDTH = 56
 -- The side of its neighbor the last panel closed by its shortcut occupied; a new panel opens there.
 local SIDE_KEY = "panel-side:v1"
 

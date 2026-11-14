@@ -333,8 +333,9 @@ reload = function(s: any)
 	else
 		local key = recent_key(s)
 		if s.recent_scope ~= key then
-			-- Never show the previous scope's chats under the new scope while its snapshot runs.
-			s.recent, s.recent_error = {}, nil
+			-- Never show the previous scope's chats under the new scope while its snapshot runs; dropping the
+			-- cached scope keeps the rows "loading" until this scope's own answer lands.
+			s.recent, s.recent_error, s.recent_scope = {}, nil, nil
 			rebuild(s)
 		end
 		s.recent_pending = if s.mode == "projects" then key else nil

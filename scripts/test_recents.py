@@ -159,6 +159,13 @@ stale.cb({projects = {}, settings = {}, pinned = {}, recent = {{uid = "stale-1"}
 check(#retargeted.recent == 0 and not shows(retargeted, "stale-1"), "a superseded scope's response is ignored")
 fresh.cb({projects = {}, settings = {}, pinned = {}, recent = {{uid = "fresh-1"}}}, nil)
 check(uids(retargeted.recent) == "fresh-1", "the current scope's response applies")
+-- Switching away and back before either answer lands stays loading through later rebuilds.
+action(retargeted, "recent", "all")
+action(retargeted, "recent", "folder")
+action(retargeted, "mode", "projects")
+check(note(retargeted, "recent:wait") == "Loading chats…", "switching back before either answer lands stays loading after a rebuild")
+flush()
+check(uids(retargeted.recent) == "fresh-1", "the folder's own answer then replaces the loading state")
 -- A failed snapshot shows an error and never the previous list.
 snapshot_error = "backend unavailable"
 action(retargeted, "reload")

@@ -50,6 +50,7 @@ tern plugin reload                                   # Reload plugin in running 
 | `lib/ui.luau`, `lib/picker.luau`, `lib/project-editor.luau`, `lib/fmt.luau` | Shared widgets, selection sheets, project drafts/directory browser, formatting. |
 | `indexer/src/main.rs`, `indexer/src/model.rs`, `indexer/src/text.rs`, `indexer/src/git.rs` | CLI entry, data types, quoting/timestamps, Git/worktree resolution. |
 | `indexer/src/db.rs`, `indexer/src/library.rs`, `indexer/src/sessions.rs` | Disposable index, durable library, session projections/scopes/paging. |
+| `indexer/src/transcript.rs` | Read-only chat preview: parses OMP/Claude Code transcripts, condenses tool calls, fits Tern's update budget. |
 | `indexer/src/harnesses.rs`, `indexer/src/adapters/`, `indexer/src/delete*.rs` | Verified harness discovery/launch, session parsing, fail-closed source deletion. |
 | `indexer/tests/` | Real-binary integration tests. |
 | `scripts/build.sh`, `scripts/check-luau.py`, `.github/workflows/ci.yml` | Release build, Luau compilation, CI checks. |
@@ -103,3 +104,9 @@ For a new harness, follow [docs/adding-a-harness.md](docs/adding-a-harness.md) r
 - Open chat tabs through the host CLI, resolving the panel's exact window and session before creation and focus. Never fall back to the CLI's default target when the originating panel cannot be found.
 - Create fallback `launch:<nonce>` claims only after the CLI fails. Bind each claim to the exact pane, command, and directory; expire it after 10 seconds and consume it before tab creation. Link fallback still requires a live focused Projects panel on the local host.
 - Resolve Codex/Claude Resume commands at both launch boundaries: current persisted host ACP preferences for the CLI, and current window preferences for link fallback. Preserve backend/copy commands and `agents.auto_acp` / `agents.keep_tui` opt-outs.
+
+## Chat preview
+
+- The preview is read-only: the panel fetches the selected chat through the `transcript` library request and never launches an agent or adds a block. A selection moved by a reload or by search paging refetches it; `Esc`, `Space` on the shown chat, or the close button closes it.
+- Read only inside the harness's own history folder (`source` without its `agent:` prefix) and refuse any other path. Parse OMP and Claude Code; other harnesses keep the backend's "not available" notice, and no preview affordance is offered for them.
+- Return at most the newest 128 KiB of markdown from at most 400 turns, plus how many messages were omitted, so one canvas update stays inside Tern's limits. Hide thinking and tool output; condense consecutive tool calls to one line.

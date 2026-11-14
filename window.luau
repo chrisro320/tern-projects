@@ -71,8 +71,9 @@ local function toggle(cx: SessionContext, mode: string)
 	end
 
 	if panel ~= nil then
-		-- After a plugin reload the mode is unknown; the shortcut on a focused panel still closes it.
-		if f == panel and (last_mode[panel] or mode) == mode then
+		-- After a plugin reload the mode is unknown; the Projects shortcut on a focused panel still closes it,
+		-- while Search and Settings still switch it.
+		if f == panel and (last_mode[panel] or "projects") == mode then
 			-- Same key again while panel is focused: close it, remembering where it was.
 			local side = panel_side(cx, tab, panel)
 			if side then pcall(tern.kv.set, SIDE_KEY, side) end
@@ -131,9 +132,11 @@ local function toggle(cx: SessionContext, mode: string)
 			return
 		end
 		local c = tonumber(data)
-		-- Only a side panel is narrowed, from the edge that faces its neighbor.
-		if c ~= nil and c > WIDTH + 2 and (side == "left" or side == "right") then
-			cx2.layout:resize(new_pane :: number, if side == "left" then "right" else "left", -(c - WIDTH))
+		-- Only a side panel is narrowed, from the edge that faces its neighbor. Read where it actually
+		-- landed: the fallback above cannot choose a side.
+		local placed = panel_side(cx2, tab :: number, new_pane :: number)
+		if c ~= nil and c > WIDTH + 2 and (placed == "left" or placed == "right") then
+			cx2.layout:resize(new_pane :: number, if placed == "left" then "right" else "left", -(c - WIDTH))
 		end
 	end)
 end

@@ -417,29 +417,62 @@ end
 local function preview_title(title: any): string
 	return if type(title) == "string" and title ~= "" then title else "Chat preview"
 end
--- Fetches `chat` into the open drawer, which keeps the chat it shows until the new transcript lands.
--- `want` is the newest request; an older reply, or one for a closed drawer, is dropped.
-local function load_preview(s: any, chat: any, delay: number?)
+-- One transcript request per panel: while it runs, only the newest wanted chat is remembered and
+-- fetched when the answer lands. The drawer keeps the chat it shows until a new transcript arrives.
+local function fetch_preview(s: any)
 	local p = s.preview
+	if s.preview_busy or not p.pending then return end
+	local chat = p.pending
+	p.pending = nil
+	-- The panel owns the slot: an answer for a drawer closed meanwhile still frees it.
+	s.preview_busy = true
 	p.seq += 1
 	local seq = p.seq
-	p.want = chat.uid
-	local function go()
-		if not live(s) or s.preview ~= p or p.seq ~= seq then return end
-		cli.request({op = "transcript", uid = chat.uid}, function(data, err)
-			if not live(s) or s.preview ~= p or p.seq ~= seq then return end
+	cli.request({op = "transcript", uid = chat.uid}, function(data, err)
+		if not live(s) then return end
+		s.preview_busy = false
+		-- A cleared drawer or a newer wanted chat drops this answer; seq also drops reopened ones.
+		if s.preview == p and p.seq == seq and p.want == chat.uid then
 			local ok = err == nil and type(data) == "table" and type(data.turns) == "table"
 			p.agent = chat.agent
 			p.title = if ok and type(data.title) == "string" and data.title ~= "" then data.title else preview_title(chat.title)
 			p.data = if ok then data else nil
 			p.error = if ok then nil else (err or "The backend returned no transcript.")
+			p.hint = nil
 			s.cx:render()
+		end
+		if s.preview and s.preview.pending then fetch_preview(s) end
+	end)
+end
+local function load_preview(s: any, chat: any, delay: number?)
+	local p = s.preview
+	p.pending = chat
+	p.want = chat.uid
+	p.hint = nil
+	if delay then
+		tern.timer(delay, function()
+			if not live(s) or s.preview ~= p or p.pending ~= chat then return end
+			fetch_preview(s)
 		end)
+	else
+		fetch_preview(s)
 	end
-	if delay then tern.timer(delay, go) else go() end
 end
 local function close_preview(s: any)
 	s.preview = nil
+end
+-- The drawer no longer shows a chat: drop what it shows and anything still on its way.
+local function clear_preview(s: any)
+	local p = s.preview
+	if not p or (p.want == nil and p.pending == nil and p.data == nil and p.error == nil) then return end
+	p.seq += 1
+	p.want = nil
+	p.pending = nil
+	p.data = nil
+	p.error = nil
+	p.agent = nil
+	p.title = preview_title(nil)
+	p.hint = "No chat selected."
 end
 -- Space, the dock button and the menu open the drawer on `chat`, or close it when it already shows that chat.
 local function toggle_preview(s: any, chat: any)
@@ -460,8 +493,10 @@ end
 follow_preview = function(s: any)
 	if not s.preview then return end
 	local row = s.rows[s.sel or ""]
+	-- A project row or no selection at all leaves nothing to follow: stale text must not stay.
+	if not row or row.kind ~= "session" then clear_preview(s); return end
 	-- Other harnesses still replace the shown chat, with the backend's "not available" notice.
-	if not row or row.kind ~= "session" or row.ref.uid == s.preview.want then return end
+	if row.ref.uid == s.preview.want then return end
 	load_preview(s, row.ref, PREVIEW_DELAY)
 end
 
@@ -1983,7 +2018,7 @@ local function preview_view(s: any): any
 	if p.error then
 		table.insert(kids, ui.el("div", {key = "error", class = "tp-chat-msg agent", text = fmt.error(p.error)}))
 	elseif not data then
-		table.insert(kids, ui.el("div", {key = "loading", class = "tp-chat-meta", text = "Loading…"}))
+		table.insert(kids, ui.el("div", {key = "loading", class = "tp-chat-meta", text = p.hint or "Loading…"}))
 	else
 		local label = if type(data.label) == "string" then data.label else "Agent"
 		table.insert(kids, ui.el("div", {key = "meta", class = "tp-chat-meta", text = label .. " · " .. fmt.path(tostring(data.cwd or ""))}))

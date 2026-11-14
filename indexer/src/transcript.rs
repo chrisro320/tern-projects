@@ -855,8 +855,9 @@ mod tests {
         let mut reads = 0;
         let result: Result<u64> = stable_snapshot(&path, |len| {
             reads += 1;
-            // The session is rewritten shorter while the preview loads; both passes must retry.
-            std::fs::write(&path, "1").unwrap();
+            // The session is rewritten shorter during each read; both passes must retry, then
+            // refuse. Shrinking every time keeps this independent of file-time resolution.
+            std::fs::write(&path, if reads == 1 { "12" } else { "1" }).unwrap();
             Ok(len)
         });
         assert_eq!(reads, 2, "retry both passes once, then refuse");

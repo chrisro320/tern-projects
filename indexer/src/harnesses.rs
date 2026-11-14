@@ -68,6 +68,8 @@ pub struct Executable {
     pub id: String,
     pub path: PathBuf,
     pub help: String,
+    /// OMP behind the local release gate, which answers `--help` itself.
+    gated: bool,
     home: PathBuf,
     fingerprint: Fingerprint,
 }
@@ -75,7 +77,7 @@ pub struct Executable {
 impl Executable {
     /// Match option declarations, not arbitrary prose mentioning another flag.
     pub fn supports_flag(&self, flag: &str) -> bool {
-        help_has_flag(&self.help, flag)
+        (self.gated && GATED_OMP_FLAGS.contains(&flag)) || help_has_flag(&self.help, flag)
     }
 
     /// Probe a named subcommand using argv, never a shell. Returning the root
@@ -138,13 +140,15 @@ pub fn discover(home: &Path, id: &str) -> Result<Option<Executable>> {
             safe_text(path_text(&path)?, "Executable path")?;
             let fingerprint = Fingerprint::read(&path)?;
             let help = probe(&path, home, id, &["--help"])?;
-            if !identifies(id, &help) {
+            let gated = id == "omp" && omp_release_gate(&help)?;
+            if !gated && !identifies(id, &help) {
                 bail!("help does not identify {}", label(id));
             }
             let executable = Executable {
                 id: id.to_owned(),
                 path,
                 help,
+                gated,
                 home: home.to_path_buf(),
                 fingerprint,
             };
@@ -334,6 +338,36 @@ fn safe_text(value: &str, name: &str) -> Result<()> {
         bail!("{name} must not be empty or contain NUL/newline characters");
     }
     Ok(())
+}
+
+/// Every OMP release behind the local release gate (18.16.0 onward) declares these.
+const GATED_OMP_FLAGS: &[&str] = &["--cwd", "--config", "--add-dir"];
+
+/// The local OMP release gate answers `--help` with `omp/<version> (installed;
+/// <state>)` instead of OMP's own help. Ready means launching through the gate
+/// starts that OMP; any other state names the old OMP processes that must exit
+/// first. Output in any other shape is not the gate.
+fn omp_release_gate(help: &str) -> Result<bool> {
+    let Some(line) = help.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return Ok(false);
+    };
+    let Some((version, state)) = line
+        .strip_prefix("omp/")
+        .and_then(|rest| rest.split_once(" (installed; "))
+        .and_then(|(version, rest)| Some((version, rest.strip_suffix(')')?)))
+    else {
+        return Ok(false);
+    };
+    if !version
+        .split('.')
+        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Ok(false);
+    }
+    if state == "ready for a new process" {
+        return Ok(true);
+    }
+    bail!("OMP {version} is installed but cannot start until older OMP processes exit ({state})")
 }
 
 fn help_has_flag(help: &str, flag: &str) -> bool {
@@ -714,6 +748,54 @@ mod tests {
         assert!(identifies("codex", "Codex CLI\nUsage: codex [OPTIONS]"));
         assert!(identifies("omp", "omp v18.11.0\nUSAGE"));
         assert!(!identifies("pi", "omp v18.11.0\nPI_CODING_AGENT_DIR"));
+    }
+
+    #[test]
+    fn recognizes_only_the_local_omp_release_gate() {
+        let ready = "omp/18.20.0 (installed; ready for a new process)\nInstallation gate only. Close old OMP sessions/brokers normally, then launch omp.\n\n";
+        assert!(omp_release_gate(ready).unwrap());
+        let blocked =
+            omp_release_gate("omp/18.20.0 (installed; restart required; old owners: 12,34)\n")
+                .unwrap_err()
+                .to_string();
+        assert!(
+            blocked.contains("OMP 18.20.0") && blocked.contains("old owners: 12,34"),
+            "{blocked}"
+        );
+        for other in [
+            "omp v18.11.0\nUSAGE",
+            "",
+            "Usage: tool\nomp/18.20.0 (installed; ready for a new process)",
+            "omp/18.20.0 installed; ready for a new process",
+            "omp/18..0 (installed; ready for a new process)",
+            "omp/latest (installed; ready for a new process)",
+            "omp/18.20.0 (installed; ready for a new process) and more",
+        ] {
+            assert!(!omp_release_gate(other).unwrap(), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn gated_omp_declares_only_the_launch_flags() {
+        // Any real executable works: only its identity is fingerprinted.
+        let path = std::env::current_exe().unwrap();
+        let gate = |gated| Executable {
+            id: "omp".to_owned(),
+            path: path.clone(),
+            help: "omp/18.20.0 (installed; ready for a new process)\n".to_owned(),
+            gated,
+            home: PathBuf::new(),
+            fingerprint: Fingerprint::read(&path).unwrap(),
+        };
+        let gated = gate(true);
+        assert!(
+            gated.supports_flag("--cwd")
+                && gated.supports_flag("--config")
+                && gated.supports_flag("--add-dir")
+        );
+        assert!(gated.multi_root());
+        assert!(!gated.supports_flag("--resume"));
+        assert!(!gate(false).supports_flag("--cwd"));
     }
 
     #[test]

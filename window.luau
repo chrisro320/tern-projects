@@ -15,6 +15,9 @@ follow.start()
 
 local KIND = "tern-projects.panel"
 local WIDTH = 56
+-- The window's width in cells, from the last side panel's reported width: it turns WIDTH into the share a new
+-- panel opens at, so the panel appears at its width instead of opening at half and then shrinking.
+local WINDOW_COLS_KEY = "window-cols:v1"
 -- The side of its neighbor the last panel closed by its shortcut occupied; a new panel opens there.
 local SIDE_KEY = "panel-side:v1"
 
@@ -50,6 +53,20 @@ local function panel_side(cx: SessionContext, tab: number, pane: number): string
 		return nil
 	end
 	return if layout then find(layout.root, nil, 0) else nil
+end
+
+-- The share of the tab's width `pane` gets through side-by-side splits; nil when it is not in `node`.
+local function width_share(node: any, pane: number): number?
+	if node.pane == pane then return 1 end
+	for i = 1, 2 do
+		local share = if node[i] then width_share(node[i], pane) else nil
+		if share then
+			if node.split ~= "right" then return share end
+			local r = node.ratio or 0.5
+			return share * (if i == 1 then r else 1 - r)
+		end
+	end
+	return nil
 end
 
 -- Toggle or open the projects panel in `mode` for the current tab.
@@ -107,14 +124,22 @@ local function toggle(cx: SessionContext, mode: string)
 		return
 	end
 
-	-- Create a new panel.
-	pcall(tern.fs.remove, tern.plugin.data .. "/panel-cols")
+	-- Create a new panel. A side panel opens straight at WIDTH columns as its share of the pane it splits; only
+	-- the first panel in a window, or one after the window changed width, needs one correcting move.
 	local new_cwd = fi ~= nil and (fi.cwd or "") or ""
 	local ok_side, saved_side = pcall(tern.kv.get, SIDE_KEY)
 	local side: string = if ok_side and (saved_side == "right" or saved_side == "up" or saved_side == "down") then saved_side else "left"
-	local new_pane = cx.layout:split(f :: number, side :: any, { block = KIND, args = { mode, new_cwd } })
+	local layout = cx.session:layout(tab)
+	local target_share = if layout then width_share(layout.root, f :: number) else nil
+	local ok_cols, window_cols = pcall(tern.kv.get, WINDOW_COLS_KEY)
+	local ratio: number? = nil
+	if (side == "left" or side == "right") and target_share and ok_cols and type(window_cols) == "number" then
+		-- Never more than half: a narrow pane keeps its own half instead of being squeezed.
+		ratio = math.clamp(WIDTH / (window_cols * target_share), 0.05, 0.5)
+	end
+	local new_pane = cx:new_block(KIND, { mode, new_cwd }, "beside", { target = f, dir = side :: any, ratio = ratio })
 	if new_pane == nil then
-		-- Tern 0.9.5 cannot resolve some live pane ids passed back to split; open beside the focused pane instead.
+		-- Tern 0.9.5 cannot resolve some live pane ids passed back as a target; open beside the focused pane instead.
 		new_pane = cx:new_block(KIND, { mode, new_cwd }, "split")
 	end
 	if new_pane == nil then
@@ -125,30 +150,32 @@ local function toggle(cx: SessionContext, mode: string)
 	prev_focus[new_pane] = f :: number
 	follow.track(fi)
 
-	-- The block writes its real width on every resize. Narrow a wide new sidebar once that width is in, then
-	-- correct the few cells a divider move can miss, from the width it reports next.
-	local path = tern.plugin.data .. "/panel-cols"
-	local tries, moves = 0, 0
-	local function narrow(cx2: SessionContext)
+	-- A new panel reports its first width once (blocks/panel.luau). It teaches the window's width to the next
+	-- panel and corrects this one in a single move when its share was a guess.
+	local path = tern.plugin.data .. "/panel-cols-" .. tostring(new_pane)
+	local tries = 0
+	local function settle(cx2: SessionContext)
 		local ok, data = pcall(tern.fs.read, path)
 		local c = if ok then tonumber(data) else nil
 		if c == nil then
 			tries += 1
-			if tries < 20 then tern.timer(100, narrow) end
+			if tries < 40 then tern.timer(50, settle) end
 			return
 		end
-		-- Only a side panel is narrowed, from the edge that faces its neighbor. Read where it actually
+		pcall(tern.fs.remove, path)
+		-- Only a side panel is sized, from the edge that faces its neighbor. Read where it actually
 		-- landed: the fallback above cannot choose a side.
 		local placed = panel_side(cx2, tab :: number, new_pane :: number)
 		if placed ~= "left" and placed ~= "right" then return end
-		if c == WIDTH or moves >= 3 or (moves == 0 and c <= WIDTH + 2) then return end
-		pcall(tern.fs.remove, path)
-		moves += 1; tries = 0
-		if cx2.layout:resize(new_pane :: number, if placed == "left" then "right" else "left", WIDTH - c) then
-			tern.timer(100, narrow)
+		local now = cx2.session:layout(tab :: number)
+		local share = if now then width_share(now.root, new_pane :: number) else nil
+		if share and share > 0 then pcall(tern.kv.set, WINDOW_COLS_KEY, c / share) end
+		local grow_room = ratio ~= nil and ratio < 0.5
+		if c > WIDTH + 1 or (c < WIDTH - 1 and grow_room) then
+			cx2.layout:resize(new_pane :: number, if placed == "left" then "right" else "left", WIDTH - c)
 		end
 	end
-	tern.timer(100, narrow)
+	tern.timer(50, settle)
 end
 
 -- User overrides take precedence over plugin defaults. Migrate only exact old actions.
@@ -244,6 +271,8 @@ tern.command({
 tern.on("pane_closed", function(ev: any, _cx: any)
 	last_mode[ev.pane] = nil
 	prev_focus[ev.pane] = nil
+	-- A panel closed before its first width was read leaves the report behind.
+	pcall(tern.fs.remove, tern.plugin.data .. "/panel-cols-" .. tostring(ev.pane))
 end)
 
 local function publish_shortcuts(cx: SessionContext, pane: number)

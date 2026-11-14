@@ -2097,6 +2097,8 @@ local panel: BlockDef<any> = {
 			if saved.sort == "updated" or saved.sort == "relevance" then s.sort = saved.sort end
 			if type(saved.query) == "string" then tf.set(s.query, saved.query) end
 		end
+		-- Only a newly opened panel reports its first width, for window.luau to size it; a restored one keeps its own.
+		s.report_width = saved == nil
 		s.update_snapshot = updates.get()
 		s.update_unsubscribe = updates.subscribe(function()
 			if not live(s) then return end
@@ -2124,10 +2126,13 @@ local panel: BlockDef<any> = {
 		return s
 	end,
 	save = function(s) return {mode = s.mode, view = s.view, query = s.query.text, scope = s.scope, sort = s.sort, recents = s.recent_filter, ctx_cwd = s.ctx_cwd} end,
-	-- Width-dependent layout (row previews, icon-only controls) must follow pane resizes. window.luau sizes a new
-	-- sidebar from the reported widths; `cx.cols` before the first report is only a placeholder.
-	resize = function(s, cols, _rows, _cx)
-		pcall(tern.fs.write, tern.plugin.data .. "/panel-cols", tostring(cols))
+	-- Width-dependent layout (row previews, icon-only controls) must follow pane resizes. `cx.cols` before the
+	-- first report is only a placeholder.
+	resize = function(s, cols, _rows, cx)
+		if s.report_width then
+			s.report_width = false
+			pcall(tern.fs.write, tern.plugin.data .. "/panel-cols-" .. tostring(cx.pane), tostring(cols))
+		end
 		s.cols = cols
 	end,
 	title = function(s) return if s.mode == "projects" then "Projects" elseif s.mode == "search" then "Projects · Search" elseif s.mode == "workspaces" then "Projects · Workspaces" else "Projects · Settings" end,

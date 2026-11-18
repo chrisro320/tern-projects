@@ -2062,7 +2062,8 @@ local function layer_view(s: any): any?
 	end
 	if s.picker then return ui.col({picker.view(s.picker, s.busy)}) end
 	local kids: {any} = {}
-	if s.preview and s.mode ~= "settings" then table.insert(kids, preview_view(s)) end
+	-- Workspaces hides the drawer like Settings: its own dialogs keep the layer.
+	if s.preview and s.mode ~= "settings" and s.mode ~= "workspaces" then table.insert(kids, preview_view(s)) end
 	if s.mode == "workspaces" then
 		local layer = workspaces.layer(s)
 		if layer then table.insert(kids, layer) end
@@ -2207,7 +2208,7 @@ local panel: BlockDef<any> = {
 		end
 		if s.confirm then return confirm_key(s, k) end
 		if s.menu then return menu_key(s, k) end
-		if k.name == "escape" and s.preview and s.mode ~= "settings" then close_preview(s); return true end
+		if k.name == "escape" and s.preview and s.mode ~= "settings" and s.mode ~= "workspaces" then close_preview(s); return true end
 		if s.mode == "workspaces" and workspaces.key(s, k) then return true end
 		local name = k.name
 		if name == "tab" then
